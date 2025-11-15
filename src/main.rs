@@ -2,7 +2,6 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fs,
-    io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -10,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use dialoguer::{Error as DialoguerError, Input, Select, theme::ColorfulTheme};
+use dialoguer::{Select, theme::ColorfulTheme};
 use dirs_next::data_dir;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -29,7 +28,6 @@ struct Cli {
     /// Prefer dubbed episodes
     #[arg(long)]
     dub: bool,
-
     /// Show history and optionally replay previous episodes
     #[arg(long)]
     history: bool,
@@ -592,46 +590,24 @@ async fn play_show(
         .unwrap_or_else(|| latest_available.clone());
 
     loop {
-        let prompt_default = current_episode.clone();
-        let mut raw_input = match Input::with_theme(&theme())
-            .with_prompt("Episode to play (Enter=next, p=previous, Esc=quit)")
-            .default(prompt_default.clone())
-            .interact_text()
-        {
-            Ok(value) => value,
-            Err(DialoguerError::IO(err)) if err.kind() == ErrorKind::Interrupted => {
-                println!("Exiting playback loop.");
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
+        let default_idx = episodes
+            .iter()
+            .position(|ep| ep == &current_episode)
+            .or_else(|| episodes.iter().position(|ep| ep == &latest_available))
+            .unwrap_or(0);
+
+        let selection = Select::with_theme(&theme())
+            .with_prompt("Episode to play (Enter to select, Esc to cancel)")
+            .items(&episodes)
+            .default(default_idx)
+            .interact_opt()?;
+        let Some(idx) = selection else {
+            println!("Exiting playback loop.");
+            return Ok(());
         };
 
-        let mut auto_advance = false;
-        let trimmed = raw_input.trim();
-        if trimmed.eq_ignore_ascii_case("p") {
-            raw_input = match previous_episode_label(&current_episode, &episodes) {
-                Some(prev) => prev,
-                None => {
-                    println!("No earlier episode available.");
-                    current_episode = prompt_default;
-                    continue;
-                }
-            };
-        } else if trimmed.is_empty() {
-            auto_advance = true;
-            raw_input = prompt_default;
-        }
-
-        if !episodes.iter().any(|ep| ep == &raw_input) {
-            println!(
-                "Episode {raw_input} is not available for {} translation.",
-                translation.label()
-            );
-            current_episode = latest_available.clone();
-            continue;
-        }
-
-        let chosen = raw_input;
+        let chosen = episodes[idx].clone();
+        let auto_advance = idx == default_idx;
 
         let sources = match client
             .fetch_episode_sources(&show.id, translation, &chosen)
@@ -680,11 +656,17 @@ async fn play_show(
             watched_at: Utc::now(),
         });
         history.save(history_path)?;
-        let has_next = next_candidate.is_some();
-        current_episode = next_candidate.unwrap_or_else(|| chosen_copy.clone());
-        if auto_advance && !has_next {
-            println!("No further episodes found. Exiting.");
-            return Ok(());
+        match (auto_advance, next_candidate) {
+            (true, Some(next)) => {
+                current_episode = next;
+            }
+            (true, None) => {
+                println!("No further episodes found. Exiting.");
+                return Ok(());
+            }
+            (false, candidate) => {
+                current_episode = candidate.unwrap_or_else(|| chosen_copy.clone());
+            }
         }
     }
 }
@@ -950,16 +932,6 @@ fn next_episode_label(current: &str, episodes: &[String]) -> Option<String> {
     let sorted = sorted_episode_labels(episodes);
     let pos = sorted.iter().position(|ep| ep == current)?;
     sorted.get(pos + 1).cloned()
-}
-
-fn previous_episode_label(current: &str, episodes: &[String]) -> Option<String> {
-    let sorted = sorted_episode_labels(episodes);
-    let pos = sorted.iter().position(|ep| ep == current)?;
-    if pos == 0 {
-        None
-    } else {
-        sorted.get(pos - 1).cloned()
-    }
 }
 
 fn history_path() -> Result<PathBuf> {
