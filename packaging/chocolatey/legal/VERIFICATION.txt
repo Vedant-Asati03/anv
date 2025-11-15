@@ -1,0 +1,16 @@
+VERIFICATION
+------------
+
+Software: anv
+Version: 0.1.0
+Author: Vedant Asati
+Project URL: https://github.com/Vedant-Asati03/anv
+Download URL: https://github.com/Vedant-Asati03/anv/releases/download/v0.1.0/anv-0.1.0-x86_64-pc-windows-msvc.zip
+Checksum (SHA256): e1e22a53224e3a503602c95b6cb0012ce5a74951d57ce69e835d7a53e79ed1b5
+
+To verify the binary:
+1. Download the release archive from the URL above.
+2. Obtain the SHA256 checksum published on the GitHub release page.
+3. Calculate the checksum locally and ensure it matches the published value.
+
+The binary is built from the source available at the project URL. Chocolatey package maintainers should verify the checksum with every release update.

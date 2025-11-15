@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>anv</id>
+    <version>0.1.0</version>
+    <title>anv</title>
+    <authors>Vedant Asati</authors>
+    <owners>Vedant Asati</owners>
+    <projectUrl>https://github.com/Vedant-Asati03/anv</projectUrl>
+    <licenseUrl>https://raw.githubusercontent.com/Vedant-Asati03/anv/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>anv is a terminal-native anime launcher that searches AllAnime and streams directly into mpv or any player you configure.</description>
+    <summary>Stream subbed or dubbed anime from AllAnime directly into mpv from Windows.</summary>
+    <tags>anime mpv cli streaming rust</tags>
+    <releaseNotes>https://github.com/Vedant-Asati03/anv/releases</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+    <file src="legal\**" target="legal" />
+  </files>
+</package>
