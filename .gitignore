@@ -1,1 +1,9 @@
 /target
+
+# Release archives produced for Chocolatey
+/anv-*-x86_64-pc-windows-msvc.zip
+/*.nupkg
+
+# Temporary files created during Chocolatey packaging
+/packaging/chocolatey/tools/bin/
+/packaging/chocolatey/tools/*.zip
