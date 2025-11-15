@@ -2,6 +2,14 @@
 name = "anv"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Vedant-Asati03/anv"
+description = "Stream subbed or dubbed anime from AllAnime straight into mpv from your terminal."
+keywords = ["anime", "cli", "streaming", "mpv"]
+categories = ["command-line-utilities", "multimedia::video"]
+authors = ["Vedant Asati"]
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1.0.100"
