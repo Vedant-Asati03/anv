@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -9,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use dialoguer::{Input, Select, theme::ColorfulTheme};
+use dialoguer::{Error as DialoguerError, Input, Select, theme::ColorfulTheme};
 use dirs_next::data_dir;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -122,6 +123,7 @@ impl History {
             println!("History is empty.");
             return Ok(None);
         }
+
         let theme = theme();
         let items: Vec<String> = self
             .entries
@@ -136,6 +138,7 @@ impl History {
                 )
             })
             .collect();
+
         let selection = Select::with_theme(&theme)
             .with_prompt("Select an entry to replay (Esc to cancel)")
             .items(&items)
@@ -468,15 +471,25 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    let history_mode =
+        cli.history || (cli.query.len() == 1 && cli.query[0].eq_ignore_ascii_case("history"));
+    let history_path = history_path()?;
+    let mut history = History::load(&history_path)?;
     let translation = if cli.dub {
         Translation::Dub
     } else {
         Translation::Sub
     };
-    let history_mode =
-        cli.history || (cli.query.len() == 1 && cli.query[0].eq_ignore_ascii_case("history"));
-    let history_path = history_path()?;
-    let mut history = History::load(&history_path)?;
+    run_anime_flow(&cli, translation, history_mode, &mut history, &history_path).await
+}
+
+async fn run_anime_flow(
+    cli: &Cli,
+    translation: Translation,
+    history_mode: bool,
+    history: &mut History,
+    history_path: &Path,
+) -> Result<()> {
     let client = AllAnimeClient::new()?;
 
     if history_mode {
@@ -486,13 +499,15 @@ async fn run() -> Result<()> {
                 title: entry.show_title.clone(),
                 available_eps: EpisodeCounts::default(),
             };
+            let preferred_episode = Some(entry.episode.clone());
+            let entry_translation = entry.translation;
             play_show(
                 &client,
-                &mut history,
-                &history_path,
-                entry.translation,
+                history,
+                history_path,
+                entry_translation,
                 show,
-                Some(entry.episode),
+                preferred_episode,
             )
             .await?;
         }
@@ -531,15 +546,7 @@ async fn run() -> Result<()> {
         return Ok(());
     };
     let show = shows[idx].clone();
-    play_show(
-        &client,
-        &mut history,
-        &history_path,
-        translation,
-        show,
-        None,
-    )
-    .await
+    play_show(&client, history, history_path, translation, show, None).await
 }
 
 async fn play_show(
@@ -580,25 +587,51 @@ async fn play_show(
         println!("Last watched {} episode: {}.", translation.label(), prev);
     }
 
-    let mut default_episode = prefer_episode
+    let mut current_episode = prefer_episode
         .or_else(|| last_watched.clone())
         .unwrap_or_else(|| latest_available.clone());
 
     loop {
-        let chosen = loop {
-            let input: String = Input::with_theme(&theme())
-                .with_prompt("Episode to play")
-                .default(default_episode.clone())
-                .interact_text()?;
-            if episodes.iter().any(|ep| ep == &input) {
-                break input;
+        let prompt_default = current_episode.clone();
+        let mut raw_input = match Input::with_theme(&theme())
+            .with_prompt("Episode to play (Enter=next, p=previous, Esc=quit)")
+            .default(prompt_default.clone())
+            .interact_text()
+        {
+            Ok(value) => value,
+            Err(DialoguerError::IO(err)) if err.kind() == ErrorKind::Interrupted => {
+                println!("Exiting playback loop.");
+                return Ok(());
             }
+            Err(err) => return Err(err.into()),
+        };
+
+        let mut auto_advance = false;
+        let trimmed = raw_input.trim();
+        if trimmed.eq_ignore_ascii_case("p") {
+            raw_input = match previous_episode_label(&current_episode, &episodes) {
+                Some(prev) => prev,
+                None => {
+                    println!("No earlier episode available.");
+                    current_episode = prompt_default;
+                    continue;
+                }
+            };
+        } else if trimmed.is_empty() {
+            auto_advance = true;
+            raw_input = prompt_default;
+        }
+
+        if !episodes.iter().any(|ep| ep == &raw_input) {
             println!(
-                "Episode {input} is not available for {} translation.",
+                "Episode {raw_input} is not available for {} translation.",
                 translation.label()
             );
-            default_episode = latest_available.clone();
-        };
+            current_episode = latest_available.clone();
+            continue;
+        }
+
+        let chosen = raw_input;
 
         let sources = match client
             .fetch_episode_sources(&show.id, translation, &chosen)
@@ -612,7 +645,7 @@ async fn play_show(
                             "Episode {chosen} is not yet available for {} translation.",
                             translation.label()
                         );
-                        default_episode = latest_available.clone();
+                        current_episode = latest_available.clone();
                         continue;
                     }
                 }
@@ -627,24 +660,32 @@ async fn play_show(
                     println!(
                         "No supported streams found for episode {chosen}. Try another episode or rerun later."
                     );
-                    default_episode = latest_available.clone();
+                    current_episode = latest_available.clone();
                     continue;
                 }
                 return Err(err);
             }
         };
 
+        let next_candidate = next_episode_label(&chosen, &episodes);
+
         launch_player(&stream, &show.title, &chosen)?;
 
+        let chosen_copy = chosen.clone();
         history.upsert(HistoryEntry {
-            show_id: show.id,
-            show_title: show.title,
-            episode: chosen,
+            show_id: show.id.clone(),
+            show_title: show.title.clone(),
+            episode: chosen_copy.clone(),
             translation,
             watched_at: Utc::now(),
         });
         history.save(history_path)?;
-        return Ok(());
+        let has_next = next_candidate.is_some();
+        current_episode = next_candidate.unwrap_or_else(|| chosen_copy.clone());
+        if auto_advance && !has_next {
+            println!("No further episodes found. Exiting.");
+            return Ok(());
+        }
     }
 }
 
@@ -727,6 +768,8 @@ fn launch_player(stream: &StreamOption, title: &str, episode: &str) -> Result<()
     let player = detect_player();
     let mut cmd = Command::new(&player);
     let media_title = format!("{title} - Episode {episode}");
+    cmd.arg("--quiet");
+    cmd.arg("--terminal=no");
     cmd.arg(format!("--force-media-title={media_title}"));
     if let Some(sub) = &stream.subtitle {
         cmd.arg(format!("--sub-file={sub}"));
@@ -894,6 +937,29 @@ fn compare_episode_labels(left: &str, right: &str) -> Ordering {
 
 fn parse_episode_key(label: &str) -> f32 {
     label.parse::<f32>().unwrap_or(0.0)
+}
+
+fn sorted_episode_labels(episodes: &[String]) -> Vec<String> {
+    let mut sorted = episodes.to_vec();
+    sorted.sort_by(|a, b| compare_episode_labels(a, b));
+    sorted.dedup();
+    sorted
+}
+
+fn next_episode_label(current: &str, episodes: &[String]) -> Option<String> {
+    let sorted = sorted_episode_labels(episodes);
+    let pos = sorted.iter().position(|ep| ep == current)?;
+    sorted.get(pos + 1).cloned()
+}
+
+fn previous_episode_label(current: &str, episodes: &[String]) -> Option<String> {
+    let sorted = sorted_episode_labels(episodes);
+    let pos = sorted.iter().position(|ep| ep == current)?;
+    if pos == 0 {
+        None
+    } else {
+        sorted.get(pos - 1).cloned()
+    }
 }
 
 fn history_path() -> Result<PathBuf> {
