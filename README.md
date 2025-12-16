@@ -7,6 +7,7 @@ anv is a terminal-native anime launcher for people who think tmux panes and watc
 - Sub or dub on demand via `--dub`; switches the query and history tagging automatically.
 - Episode selector behaves like a shell picker: arrow keys, `Enter`, `Esc` to bail.
 - Remembers what you watched last night, including translation choice – `anv --history` drops you right back in.
+- Reads manga too – `anv --manga` fetches chapters and pipes pages directly to your image viewer (mpv by default).
 - Fires up `mpv` (or whatever you export as `ANV_PLAYER`) with the highest-quality stream it can negotiate.
 
 ## Install it
@@ -33,6 +34,11 @@ anv "bocchi the rock"
 Prefer the dub:
 ```bash
 anv --dub "demon slayer"
+```
+
+Read manga chapters:
+```bash
+anv --manga "one punch man"
 ```
 
 Jump back to last night’s cliffhanger:
