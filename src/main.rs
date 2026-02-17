@@ -65,6 +65,9 @@ impl LocalPageProxy {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         if let Err(err) = handle_proxy_request(&mut stream, &targets) {
+                            if is_benign_proxy_error(&err) {
+                                continue;
+                            }
                             let _ = write_http_error(&mut stream, 500, "proxy error");
                             println!("Local cache proxy request failed: {}", err);
                         }
@@ -969,13 +972,17 @@ fn handle_proxy_request(stream: &mut TcpStream, targets: &[CachedPageTarget]) ->
 }
 
 fn write_http_ok(stream: &mut TcpStream, body: &[u8], content_type: &str) -> Result<()> {
-    write!(
+    if let Err(err) = write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
         body.len(),
         content_type
-    )
-    .context("failed to write proxy headers")?;
+    ) {
+        if is_benign_disconnect(&err) {
+            return Ok(());
+        }
+        return Err(err).context("failed to write proxy headers");
+    }
     if let Err(err) = stream.write_all(body) {
         if is_benign_disconnect(&err) {
             return Ok(());
@@ -990,12 +997,16 @@ fn write_http_head(
     content_length: usize,
     content_type: &str,
 ) -> Result<()> {
-    write!(
+    if let Err(err) = write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
         content_length, content_type
-    )
-    .context("failed to write proxy head response")?;
+    ) {
+        if is_benign_disconnect(&err) {
+            return Ok(());
+        }
+        return Err(err).context("failed to write proxy head response");
+    }
     Ok(())
 }
 
@@ -1031,6 +1042,12 @@ fn is_benign_disconnect(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::UnexpectedEof
     )
+}
+
+fn is_benign_proxy_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(is_benign_disconnect)
 }
 
 fn mime_type_for_path(path: &Path) -> &'static str {
