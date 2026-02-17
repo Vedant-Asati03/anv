@@ -1,8 +1,16 @@
 use std::{
     cmp::Ordering,
     fs,
+    io::{BufRead, BufReader, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -26,6 +34,76 @@ const PLAYER_ENV_KEY: &str = "ANV_PLAYER";
 const INITIAL_MANGA_PAGE_PRELOAD: usize = 5;
 const CACHE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36";
 const CACHE_ACCEPT: &str = "image/avif,image/webp,image/*,*/*;q=0.8";
+
+#[derive(Clone)]
+struct CachedPageTarget {
+    page: Page,
+    path: PathBuf,
+}
+
+struct LocalPageProxy {
+    base_url: String,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl LocalPageProxy {
+    fn start(targets: Vec<CachedPageTarget>) -> Result<Self> {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).context("failed to bind local page cache proxy")?;
+        let addr = listener
+            .local_addr()
+            .context("failed to read local proxy address")?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure local proxy socket")?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_signal.load(AtomicOrdering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if let Err(err) = handle_proxy_request(&mut stream, &targets) {
+                            let _ = write_http_error(&mut stream, 500, "proxy error");
+                            println!("Local cache proxy request failed: {}", err);
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(err) => {
+                        println!("Local cache proxy accept failed: {}", err);
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            base_url: format!("http://127.0.0.1:{}", addr.port()),
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn page_url(&self, idx: usize) -> String {
+        format!("{}/{}", self.base_url, idx)
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, AtomicOrdering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for LocalPageProxy {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "anv", about = "Stream anime from AllAnime via mpv.", version)]
@@ -316,9 +394,9 @@ async fn read_manga(
 
         let next_candidate = next_episode_label(&chosen, &chapters);
         println!("Caching chapter pages locally...");
-        let cached_pages = match cache_manga_pages(&pages, &manga.id, translation, &chosen).await {
-            Ok(paths) => {
-                let cached_count = paths.iter().filter(|p| p.is_some()).count();
+        let cache_state = match cache_manga_pages(&pages, &manga.id, translation, &chosen).await {
+            Ok(state) => {
+                let cached_count = state.cached_pages.iter().filter(|p| p.is_some()).count();
                 println!(
                     "Cached {cached_count}/{} pages upfront for Chapter {} (first {} pages).",
                     pages.len(),
@@ -328,18 +406,27 @@ async fn read_manga(
                 if pages.len() > INITIAL_MANGA_PAGE_PRELOAD {
                     println!("Continuing to cache remaining pages in background...");
                 }
-                paths
+                state
             }
             Err(err) => {
                 println!(
                     "Page cache unavailable for Chapter {} ({}). Falling back to streaming URLs.",
                     chosen, err
                 );
-                vec![None; pages.len()]
+                MangaCacheState {
+                    cached_pages: vec![None; pages.len()],
+                    cache_files: Vec::new(),
+                }
             }
         };
 
-        launch_image_viewer(&pages, &cached_pages, &manga.title, &chosen)?;
+        launch_image_viewer(
+            &pages,
+            &cache_state.cached_pages,
+            &cache_state.cache_files,
+            &manga.title,
+            &chosen,
+        )?;
 
         let chosen_copy = chosen.clone();
         history.upsert(HistoryEntry {
@@ -370,6 +457,7 @@ async fn read_manga(
 fn launch_image_viewer(
     pages: &[Page],
     cached_pages: &[Option<PathBuf>],
+    cache_files: &[PathBuf],
     title: &str,
     chapter: &str,
 ) -> Result<()> {
@@ -381,26 +469,50 @@ fn launch_image_viewer(
     cmd.arg(format!("--force-media-title={media_title}"));
     cmd.arg("--image-display-duration=inf");
 
-    if let Some(first) = pages.first() {
-        for (key, value) in &first.headers {
-            if key.eq_ignore_ascii_case("referer") {
-                cmd.arg(format!("--referrer={value}"));
-                cmd.arg(format!("--http-header-fields=Referer: {value}"));
-            } else {
-                cmd.arg(format!("--http-header-fields={}: {value}", key));
-            }
+    let all_cached = cached_pages.len() == pages.len() && cached_pages.iter().all(|p| p.is_some());
+    if all_cached {
+        for path in cached_pages.iter().flatten() {
+            cmd.arg(path);
         }
-    }
+    } else if cache_files.len() == pages.len() {
+        let targets: Vec<CachedPageTarget> = pages
+            .iter()
+            .cloned()
+            .zip(cache_files.iter().cloned())
+            .map(|(page, path)| CachedPageTarget { page, path })
+            .collect();
+        match LocalPageProxy::start(targets) {
+            Ok(mut proxy) => {
+                for idx in 0..pages.len() {
+                    cmd.arg(proxy.page_url(idx));
+                }
+                println!("Launching viewer for Chapter {}...", chapter);
+                let status = cmd.status().context("failed to launch viewer")?;
+                proxy.shutdown();
 
-    if cached_pages.len() == pages.len() {
-        for (page, cached) in pages.iter().zip(cached_pages.iter()) {
-            if let Some(path) = cached {
-                cmd.arg(path);
-            } else {
-                cmd.arg(&page.url);
+                if !status.success() {
+                    bail!("viewer exited with status {status}");
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                println!(
+                    "Local cache proxy unavailable ({}). Falling back to direct URLs.",
+                    err
+                );
             }
         }
     } else {
+        if let Some(first) = pages.first() {
+            for (key, value) in &first.headers {
+                if key.eq_ignore_ascii_case("referer") {
+                    cmd.arg(format!("--referrer={value}"));
+                    cmd.arg(format!("--http-header-fields=Referer: {value}"));
+                } else {
+                    cmd.arg(format!("--http-header-fields={}: {value}", key));
+                }
+            }
+        }
         for page in pages {
             cmd.arg(&page.url);
         }
@@ -712,12 +824,17 @@ fn next_episode_label(current: &str, episodes: &[String]) -> Option<String> {
     sorted.get(pos + 1).cloned()
 }
 
+struct MangaCacheState {
+    cached_pages: Vec<Option<PathBuf>>,
+    cache_files: Vec<PathBuf>,
+}
+
 async fn cache_manga_pages(
     pages: &[Page],
     manga_id: &str,
     translation: Translation,
     chapter: &str,
-) -> Result<Vec<Option<PathBuf>>> {
+) -> Result<MangaCacheState> {
     let chapter_dir = manga_cache_chapter_dir(manga_id, translation, chapter)?;
     fs::create_dir_all(&chapter_dir)
         .with_context(|| format!("failed to create cache directory {}", chapter_dir.display()))?;
@@ -763,26 +880,22 @@ async fn cache_manga_pages(
     }
 
     if !background_jobs.is_empty() {
-        tokio::spawn(async move {
-            let http = match build_cache_http_client() {
-                Ok(http) => http,
-                Err(err) => {
-                    println!("Background cache disabled: {}", err);
-                    return;
-                }
-            };
+        std::thread::spawn(move || {
             for (page, file) in background_jobs {
                 if file.exists() {
                     continue;
                 }
-                if let Err(err) = download_page(&http, &page, &file).await {
+                if let Err(err) = download_page_curl(&page, &file) {
                     println!("Background cache miss for {}: {}", page.url, err);
                 }
             }
         });
     }
 
-    Ok(cached)
+    Ok(MangaCacheState {
+        cached_pages: cached,
+        cache_files,
+    })
 }
 
 async fn download_page(http: &Client, page: &Page, file: &Path) -> Result<()> {
@@ -798,6 +911,137 @@ fn build_cache_http_client() -> Result<Client> {
         .user_agent(CACHE_USER_AGENT)
         .build()
         .context("failed to create cache HTTP client")
+}
+
+fn handle_proxy_request(stream: &mut TcpStream, targets: &[CachedPageTarget]) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone().context("failed to clone proxy stream")?);
+    let mut request_line = String::new();
+    let bytes_read = reader
+        .read_line(&mut request_line)
+        .context("failed to read proxy request")?;
+    if bytes_read == 0 {
+        return Ok(());
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+    if method != "GET" && method != "HEAD" {
+        write_http_error(stream, 405, "method not allowed")?;
+        return Ok(());
+    }
+
+    let idx = path
+        .trim_start_matches('/')
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .parse::<usize>()
+        .ok();
+    let Some(idx) = idx else {
+        write_http_error(stream, 404, "not found")?;
+        return Ok(());
+    };
+
+    let Some(target) = targets.get(idx) else {
+        write_http_error(stream, 404, "not found")?;
+        return Ok(());
+    };
+
+    if !target.path.exists()
+        && let Err(err) = download_page_curl(&target.page, &target.path)
+    {
+        write_http_error(stream, 502, "cache fetch failed")?;
+        return Err(err.context(format!(
+            "failed to fetch page {} for proxy",
+            target.page.url
+        )));
+    }
+
+    let data = fs::read(&target.path)
+        .with_context(|| format!("failed to read cached file {}", target.path.display()))?;
+    if method == "HEAD" {
+        write_http_head(stream, data.len(), mime_type_for_path(&target.path))?;
+    } else {
+        write_http_ok(stream, &data, mime_type_for_path(&target.path))?;
+    }
+    Ok(())
+}
+
+fn write_http_ok(stream: &mut TcpStream, body: &[u8], content_type: &str) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
+        content_type
+    )
+    .context("failed to write proxy headers")?;
+    if let Err(err) = stream.write_all(body) {
+        if is_benign_disconnect(&err) {
+            return Ok(());
+        }
+        return Err(err).context("failed to write proxy response body");
+    }
+    Ok(())
+}
+
+fn write_http_head(
+    stream: &mut TcpStream,
+    content_length: usize,
+    content_type: &str,
+) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
+        content_length, content_type
+    )
+    .context("failed to write proxy head response")?;
+    Ok(())
+}
+
+fn write_http_error(stream: &mut TcpStream, status: u16, message: &str) -> Result<()> {
+    let body = message.as_bytes();
+    let reason = match status {
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        502 => "Bad Gateway",
+        _ => "Internal Server Error",
+    };
+    if let Err(err) = write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{}",
+        status,
+        reason,
+        body.len(),
+        message
+    ) {
+        if is_benign_disconnect(&err) {
+            return Ok(());
+        }
+        return Err(err).context("failed to write proxy error response");
+    }
+    Ok(())
+}
+
+fn is_benign_disconnect(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn mime_type_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn download_page_reqwest(http: &Client, page: &Page, file: &Path) -> Result<()> {
