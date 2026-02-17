@@ -8,6 +8,7 @@ anv is a terminal-native anime launcher for people who think tmux panes and watc
 - Episode selector behaves like a shell picker: arrow keys, `Enter`, `Esc` to bail.
 - Remembers what you watched last night, including translation choice – `anv --history` drops you right back in.
 - Reads manga too – `anv --manga` fetches chapters and pipes pages directly to your image viewer (mpv by default).
+- Manga page cache supports custom location via `--cache-dir`.
 - Fires up `mpv` (or whatever you export as `ANV_PLAYER`) with the highest-quality stream it can negotiate.
 
 ## Install it
@@ -41,6 +42,11 @@ Read manga chapters:
 anv --manga "one punch man"
 ```
 
+Read manga with a custom cache directory:
+```bash
+anv --manga --cache-dir "/tmp/anv-cache" "one punch man"
+```
+
 Jump back to last night’s cliffhanger:
 ```bash
 anv --history
@@ -63,6 +69,7 @@ anv "naruto"
 ## Tips and tweaks
 - Keep `mpv` upgraded – some providers only serve DASH/HLS variants that older builds struggle with.
 - If you want to experiment with custom players, `ANV_PLAYER` can be a full command string (add flags, wrappers, etc.).
+- Use `--cache-dir <DIR>` if you want manga page cache files somewhere specific (faster disk, larger partition, etc.).
 - Use `cargo install anv --force` to update when new AllAnime quirks pop up.
 
 ## Troubleshooting
