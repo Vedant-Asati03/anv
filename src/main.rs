@@ -23,6 +23,7 @@ use providers::{
 use types::{ChapterCounts, EpisodeCounts, MangaInfo, Page, ShowInfo, StreamOption, Translation};
 
 const PLAYER_ENV_KEY: &str = "ANV_PLAYER";
+const INITIAL_MANGA_PAGE_PRELOAD: usize = 5;
 const CACHE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36";
 const CACHE_ACCEPT: &str = "image/avif,image/webp,image/*,*/*;q=0.8";
 
@@ -319,10 +320,14 @@ async fn read_manga(
             Ok(paths) => {
                 let cached_count = paths.iter().filter(|p| p.is_some()).count();
                 println!(
-                    "Cached {cached_count}/{} pages for Chapter {}.",
+                    "Cached {cached_count}/{} pages upfront for Chapter {} (first {} pages).",
                     pages.len(),
-                    chosen
+                    chosen,
+                    INITIAL_MANGA_PAGE_PRELOAD
                 );
+                if pages.len() > INITIAL_MANGA_PAGE_PRELOAD {
+                    println!("Continuing to cache remaining pages in background...");
+                }
                 paths
             }
             Err(err) => {
@@ -717,28 +722,64 @@ async fn cache_manga_pages(
     fs::create_dir_all(&chapter_dir)
         .with_context(|| format!("failed to create cache directory {}", chapter_dir.display()))?;
 
-    let http = Client::builder()
-        .user_agent("Mozilla/5.0 (anv)")
-        .build()
-        .context("failed to create cache HTTP client")?;
-    let mut cached = Vec::with_capacity(pages.len());
+    let preload_target = INITIAL_MANGA_PAGE_PRELOAD.min(pages.len());
+    let cache_files: Vec<PathBuf> = pages
+        .iter()
+        .enumerate()
+        .map(|(idx, page)| {
+            let ext = infer_page_extension(&page.url);
+            chapter_dir.join(format!("{:04}.{}", idx + 1, ext))
+        })
+        .collect();
 
-    for (idx, page) in pages.iter().enumerate() {
-        let ext = infer_page_extension(&page.url);
-        let file = chapter_dir.join(format!("{:04}.{}", idx + 1, ext));
+    let http = build_cache_http_client()?;
+    let mut cached = vec![None; pages.len()];
+
+    for idx in 0..preload_target {
+        let page = &pages[idx];
+        let file = &cache_files[idx];
 
         if file.exists() {
-            cached.push(Some(file));
+            cached[idx] = Some(file.clone());
             continue;
         }
 
-        match download_page(&http, page, &file).await {
-            Ok(()) => cached.push(Some(file)),
+        match download_page(&http, page, file).await {
+            Ok(()) => cached[idx] = Some(file.clone()),
             Err(err) => {
                 println!("Cache miss for {}: {}", page.url, err);
-                cached.push(None);
             }
         }
+    }
+
+    let mut background_jobs: Vec<(Page, PathBuf)> = Vec::new();
+    for idx in preload_target..pages.len() {
+        let file = &cache_files[idx];
+        if file.exists() {
+            cached[idx] = Some(file.clone());
+            continue;
+        }
+        background_jobs.push((pages[idx].clone(), file.clone()));
+    }
+
+    if !background_jobs.is_empty() {
+        tokio::spawn(async move {
+            let http = match build_cache_http_client() {
+                Ok(http) => http,
+                Err(err) => {
+                    println!("Background cache disabled: {}", err);
+                    return;
+                }
+            };
+            for (page, file) in background_jobs {
+                if file.exists() {
+                    continue;
+                }
+                if let Err(err) = download_page(&http, &page, &file).await {
+                    println!("Background cache miss for {}: {}", page.url, err);
+                }
+            }
+        });
     }
 
     Ok(cached)
@@ -750,6 +791,13 @@ async fn download_page(http: &Client, page: &Page, file: &Path) -> Result<()> {
         Err(primary_err) => download_page_curl(page, file)
             .with_context(|| format!("reqwest failed first: {primary_err}")),
     }
+}
+
+fn build_cache_http_client() -> Result<Client> {
+    Client::builder()
+        .user_agent(CACHE_USER_AGENT)
+        .build()
+        .context("failed to create cache HTTP client")
 }
 
 async fn download_page_reqwest(http: &Client, page: &Page, file: &Path) -> Result<()> {
