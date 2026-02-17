@@ -23,6 +23,8 @@ use providers::{
 use types::{ChapterCounts, EpisodeCounts, MangaInfo, Page, ShowInfo, StreamOption, Translation};
 
 const PLAYER_ENV_KEY: &str = "ANV_PLAYER";
+const CACHE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36";
+const CACHE_ACCEPT: &str = "image/avif,image/webp,image/*,*/*;q=0.8";
 
 #[derive(Debug, Parser)]
 #[command(name = "anv", about = "Stream anime from AllAnime via mpv.", version)]
@@ -315,7 +317,12 @@ async fn read_manga(
         println!("Caching chapter pages locally...");
         let cached_pages = match cache_manga_pages(&pages, &manga.id, translation, &chosen).await {
             Ok(paths) => {
-                println!("Cached {} pages for Chapter {}.", paths.len(), chosen);
+                let cached_count = paths.iter().filter(|p| p.is_some()).count();
+                println!(
+                    "Cached {cached_count}/{} pages for Chapter {}.",
+                    pages.len(),
+                    chosen
+                );
                 paths
             }
             Err(err) => {
@@ -323,7 +330,7 @@ async fn read_manga(
                     "Page cache unavailable for Chapter {} ({}). Falling back to streaming URLs.",
                     chosen, err
                 );
-                Vec::new()
+                vec![None; pages.len()]
             }
         };
 
@@ -357,7 +364,7 @@ async fn read_manga(
 
 fn launch_image_viewer(
     pages: &[Page],
-    cached_pages: &[PathBuf],
+    cached_pages: &[Option<PathBuf>],
     title: &str,
     chapter: &str,
 ) -> Result<()> {
@@ -369,22 +376,26 @@ fn launch_image_viewer(
     cmd.arg(format!("--force-media-title={media_title}"));
     cmd.arg("--image-display-duration=inf");
 
-    if cached_pages.len() == pages.len() && !cached_pages.is_empty() {
-        for path in cached_pages {
-            cmd.arg(path);
-        }
-    } else {
-        if let Some(first) = pages.first() {
-            for (key, value) in &first.headers {
-                if key.eq_ignore_ascii_case("referer") {
-                    cmd.arg(format!("--referrer={value}"));
-                    cmd.arg(format!("--http-header-fields=Referer: {value}"));
-                } else {
-                    cmd.arg(format!("--http-header-fields={}: {value}", key));
-                }
+    if let Some(first) = pages.first() {
+        for (key, value) in &first.headers {
+            if key.eq_ignore_ascii_case("referer") {
+                cmd.arg(format!("--referrer={value}"));
+                cmd.arg(format!("--http-header-fields=Referer: {value}"));
+            } else {
+                cmd.arg(format!("--http-header-fields={}: {value}", key));
             }
         }
+    }
 
+    if cached_pages.len() == pages.len() {
+        for (page, cached) in pages.iter().zip(cached_pages.iter()) {
+            if let Some(path) = cached {
+                cmd.arg(path);
+            } else {
+                cmd.arg(&page.url);
+            }
+        }
+    } else {
         for page in pages {
             cmd.arg(&page.url);
         }
@@ -701,12 +712,15 @@ async fn cache_manga_pages(
     manga_id: &str,
     translation: Translation,
     chapter: &str,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<Option<PathBuf>>> {
     let chapter_dir = manga_cache_chapter_dir(manga_id, translation, chapter)?;
     fs::create_dir_all(&chapter_dir)
         .with_context(|| format!("failed to create cache directory {}", chapter_dir.display()))?;
 
-    let http = Client::new();
+    let http = Client::builder()
+        .user_agent("Mozilla/5.0 (anv)")
+        .build()
+        .context("failed to create cache HTTP client")?;
     let mut cached = Vec::with_capacity(pages.len());
 
     for (idx, page) in pages.iter().enumerate() {
@@ -714,29 +728,73 @@ async fn cache_manga_pages(
         let file = chapter_dir.join(format!("{:04}.{}", idx + 1, ext));
 
         if file.exists() {
-            cached.push(file);
+            cached.push(Some(file));
             continue;
         }
 
-        let mut req = http.get(&page.url);
-        for (key, value) in &page.headers {
-            req = req.header(key, value);
+        match download_page(&http, page, &file).await {
+            Ok(()) => cached.push(Some(file)),
+            Err(err) => {
+                println!("Cache miss for {}: {}", page.url, err);
+                cached.push(None);
+            }
         }
-        let bytes = req
-            .send()
-            .await
-            .with_context(|| format!("failed to download page {}", page.url))?
-            .error_for_status()
-            .with_context(|| format!("failed to download page {}", page.url))?
-            .bytes()
-            .await
-            .with_context(|| format!("failed to read page bytes {}", page.url))?;
-        fs::write(&file, bytes.as_ref())
-            .with_context(|| format!("failed to write cached page {}", file.display()))?;
-        cached.push(file);
     }
 
     Ok(cached)
+}
+
+async fn download_page(http: &Client, page: &Page, file: &Path) -> Result<()> {
+    match download_page_reqwest(http, page, file).await {
+        Ok(()) => Ok(()),
+        Err(primary_err) => download_page_curl(page, file)
+            .with_context(|| format!("reqwest failed first: {primary_err}")),
+    }
+}
+
+async fn download_page_reqwest(http: &Client, page: &Page, file: &Path) -> Result<()> {
+    let mut req = http.get(&page.url).header("Accept", CACHE_ACCEPT);
+    for (key, value) in &page.headers {
+        req = req.header(key, value);
+    }
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("request failed for {}", page.url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("HTTP {status}");
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read bytes for {}", page.url))?;
+    fs::write(file, bytes.as_ref())
+        .with_context(|| format!("failed to write cached page {}", file.display()))?;
+    Ok(())
+}
+
+fn download_page_curl(page: &Page, file: &Path) -> Result<()> {
+    let mut cmd = Command::new("curl");
+    cmd.arg("--fail")
+        .arg("--location")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--user-agent")
+        .arg(CACHE_USER_AGENT)
+        .arg("--header")
+        .arg(format!("Accept: {CACHE_ACCEPT}"));
+    for (key, value) in &page.headers {
+        cmd.arg("--header").arg(format!("{key}: {value}"));
+    }
+    cmd.arg("--output").arg(file).arg(&page.url);
+    let status = cmd
+        .status()
+        .with_context(|| "failed to run curl for cache download")?;
+    if !status.success() {
+        bail!("curl exited with status {status}");
+    }
+    Ok(())
 }
 
 fn manga_cache_chapter_dir(
