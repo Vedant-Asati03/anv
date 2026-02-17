@@ -9,8 +9,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use dialoguer::{Select, theme::ColorfulTheme};
-use dirs_next::data_dir;
-use reqwest::StatusCode;
+use dirs_next::{cache_dir, data_dir};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
 mod providers;
@@ -312,8 +312,22 @@ async fn read_manga(
         }
 
         let next_candidate = next_episode_label(&chosen, &chapters);
+        println!("Caching chapter pages locally...");
+        let cached_pages = match cache_manga_pages(&pages, &manga.id, translation, &chosen).await {
+            Ok(paths) => {
+                println!("Cached {} pages for Chapter {}.", paths.len(), chosen);
+                paths
+            }
+            Err(err) => {
+                println!(
+                    "Page cache unavailable for Chapter {} ({}). Falling back to streaming URLs.",
+                    chosen, err
+                );
+                Vec::new()
+            }
+        };
 
-        launch_image_viewer(&pages, &manga.title, &chosen)?;
+        launch_image_viewer(&pages, &cached_pages, &manga.title, &chosen)?;
 
         let chosen_copy = chosen.clone();
         history.upsert(HistoryEntry {
@@ -341,7 +355,12 @@ async fn read_manga(
     }
 }
 
-fn launch_image_viewer(pages: &[Page], title: &str, chapter: &str) -> Result<()> {
+fn launch_image_viewer(
+    pages: &[Page],
+    cached_pages: &[PathBuf],
+    title: &str,
+    chapter: &str,
+) -> Result<()> {
     let player = detect_player();
     let mut cmd = Command::new(&player);
     let media_title = format!("{title} - Chapter {chapter}");
@@ -350,19 +369,25 @@ fn launch_image_viewer(pages: &[Page], title: &str, chapter: &str) -> Result<()>
     cmd.arg(format!("--force-media-title={media_title}"));
     cmd.arg("--image-display-duration=inf");
 
-    if let Some(first) = pages.first() {
-        for (key, value) in &first.headers {
-            if key.eq_ignore_ascii_case("referer") {
-                cmd.arg(format!("--referrer={value}"));
-                cmd.arg(format!("--http-header-fields=Referer: {value}"));
-            } else {
-                cmd.arg(format!("--http-header-fields={}: {value}", key));
+    if cached_pages.len() == pages.len() && !cached_pages.is_empty() {
+        for path in cached_pages {
+            cmd.arg(path);
+        }
+    } else {
+        if let Some(first) = pages.first() {
+            for (key, value) in &first.headers {
+                if key.eq_ignore_ascii_case("referer") {
+                    cmd.arg(format!("--referrer={value}"));
+                    cmd.arg(format!("--http-header-fields=Referer: {value}"));
+                } else {
+                    cmd.arg(format!("--http-header-fields={}: {value}", key));
+                }
             }
         }
-    }
 
-    for page in pages {
-        cmd.arg(&page.url);
+        for page in pages {
+            cmd.arg(&page.url);
+        }
     }
 
     println!("Launching viewer for Chapter {}...", chapter);
@@ -669,6 +694,100 @@ fn next_episode_label(current: &str, episodes: &[String]) -> Option<String> {
     let sorted = sorted_episode_labels(episodes);
     let pos = sorted.iter().position(|ep| ep == current)?;
     sorted.get(pos + 1).cloned()
+}
+
+async fn cache_manga_pages(
+    pages: &[Page],
+    manga_id: &str,
+    translation: Translation,
+    chapter: &str,
+) -> Result<Vec<PathBuf>> {
+    let chapter_dir = manga_cache_chapter_dir(manga_id, translation, chapter)?;
+    fs::create_dir_all(&chapter_dir)
+        .with_context(|| format!("failed to create cache directory {}", chapter_dir.display()))?;
+
+    let http = Client::new();
+    let mut cached = Vec::with_capacity(pages.len());
+
+    for (idx, page) in pages.iter().enumerate() {
+        let ext = infer_page_extension(&page.url);
+        let file = chapter_dir.join(format!("{:04}.{}", idx + 1, ext));
+
+        if file.exists() {
+            cached.push(file);
+            continue;
+        }
+
+        let mut req = http.get(&page.url);
+        for (key, value) in &page.headers {
+            req = req.header(key, value);
+        }
+        let bytes = req
+            .send()
+            .await
+            .with_context(|| format!("failed to download page {}", page.url))?
+            .error_for_status()
+            .with_context(|| format!("failed to download page {}", page.url))?
+            .bytes()
+            .await
+            .with_context(|| format!("failed to read page bytes {}", page.url))?;
+        fs::write(&file, bytes.as_ref())
+            .with_context(|| format!("failed to write cached page {}", file.display()))?;
+        cached.push(file);
+    }
+
+    Ok(cached)
+}
+
+fn manga_cache_chapter_dir(
+    manga_id: &str,
+    translation: Translation,
+    chapter: &str,
+) -> Result<PathBuf> {
+    let base = cache_dir().ok_or_else(|| anyhow!("Could not determine cache directory"))?;
+    Ok(base
+        .join("anv")
+        .join("manga-pages")
+        .join(sanitize_cache_segment(manga_id))
+        .join(translation.as_str())
+        .join(sanitize_cache_segment(chapter)))
+}
+
+fn sanitize_cache_segment(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        String::from("unknown")
+    } else {
+        cleaned
+    }
+}
+
+fn infer_page_extension(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url);
+    match path.rsplit('.').next().map(|s| s.to_ascii_lowercase()) {
+        Some(ext)
+            if matches!(
+                ext.as_str(),
+                "jpg" | "jpeg" | "png" | "webp" | "avif" | "gif"
+            ) =>
+        {
+            if ext == "jpeg" {
+                String::from("jpg")
+            } else {
+                ext
+            }
+        }
+        _ => String::from("jpg"),
+    }
 }
 
 fn history_path() -> Result<PathBuf> {
