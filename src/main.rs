@@ -122,6 +122,9 @@ struct Cli {
     #[arg(long, default_value = "allanime")]
     provider: String,
 
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
     #[arg(value_name = "QUERY")]
     query: Vec<String>,
 }
@@ -321,7 +324,16 @@ async fn run_manga_flow(
         return Ok(());
     };
     let manga = mangas[idx].clone();
-    read_manga(client, translation, manga, history, history_path, None).await
+    read_manga(
+        client,
+        translation,
+        manga,
+        history,
+        history_path,
+        None,
+        cli.cache_dir.as_deref(),
+    )
+    .await
 }
 
 async fn read_manga(
@@ -331,6 +343,7 @@ async fn read_manga(
     history: &mut History,
     history_path: &Path,
     prefer_chapter: Option<String>,
+    cache_base_override: Option<&Path>,
 ) -> Result<()> {
     let chapters = client.fetch_chapters(&manga.id, translation).await?;
     if chapters.is_empty() {
@@ -397,7 +410,15 @@ async fn read_manga(
 
         let next_candidate = next_episode_label(&chosen, &chapters);
         println!("Caching chapter pages locally...");
-        let cache_state = match cache_manga_pages(&pages, &manga.id, translation, &chosen).await {
+        let cache_state = match cache_manga_pages(
+            &pages,
+            &manga.id,
+            translation,
+            &chosen,
+            cache_base_override,
+        )
+        .await
+        {
             Ok(state) => {
                 let cached_count = state.cached_pages.iter().filter(|p| p.is_some()).count();
                 println!(
@@ -556,6 +577,7 @@ async fn run_anime_flow(
                     history,
                     history_path,
                     preferred_chapter,
+                    cli.cache_dir.as_deref(),
                 )
                 .await?;
             } else {
@@ -837,8 +859,9 @@ async fn cache_manga_pages(
     manga_id: &str,
     translation: Translation,
     chapter: &str,
+    cache_base_override: Option<&Path>,
 ) -> Result<MangaCacheState> {
-    let chapter_dir = manga_cache_chapter_dir(manga_id, translation, chapter)?;
+    let chapter_dir = manga_cache_chapter_dir(manga_id, translation, chapter, cache_base_override)?;
     fs::create_dir_all(&chapter_dir)
         .with_context(|| format!("failed to create cache directory {}", chapter_dir.display()))?;
 
@@ -1110,8 +1133,13 @@ fn manga_cache_chapter_dir(
     manga_id: &str,
     translation: Translation,
     chapter: &str,
+    cache_base_override: Option<&Path>,
 ) -> Result<PathBuf> {
-    let base = cache_dir().ok_or_else(|| anyhow!("Could not determine cache directory"))?;
+    let base = if let Some(path) = cache_base_override {
+        path.to_path_buf()
+    } else {
+        cache_dir().ok_or_else(|| anyhow!("Could not determine cache directory"))?
+    };
     Ok(base
         .join("anv")
         .join("manga-pages")
