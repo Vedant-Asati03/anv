@@ -125,6 +125,9 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
 
+    #[arg(short = 'e', long, value_name = "EPISODE")]
+    episode: Option<String>,
+
     #[arg(value_name = "QUERY")]
     query: Vec<String>,
 }
@@ -635,7 +638,15 @@ async fn run_anime_flow(
         return Ok(());
     };
     let show = shows[idx].clone();
-    play_show(&client, history, history_path, translation, show, None).await
+    play_show(
+        &client,
+        history,
+        history_path,
+        translation,
+        show,
+        cli.episode.clone(),
+    )
+    .await
 }
 
 async fn play_show(
@@ -672,9 +683,36 @@ async fn play_show(
         println!("Last watched {} episode: {}.", translation.label(), prev);
     }
 
-    let mut current_episode = prefer_episode
-        .or_else(|| last_watched.clone())
-        .unwrap_or_else(|| latest_available.clone());
+    // Determine starting episode and whether to skip the selection dialog on
+    // the first iteration (when the caller provides a valid --episode flag).
+    let (mut current_episode, mut skip_selection) = match &prefer_episode {
+        Some(ep) if episodes.contains(ep) => {
+            // Valid episode flag — jump directly, skip selection on first pass.
+            (ep.clone(), true)
+        }
+        Some(ep) => {
+            // Episode flag provided but doesn't exist — warn, then show list.
+            println!(
+                "Episode '{}' does not exist for '{}'. Showing episode list.",
+                ep, show.title
+            );
+            (
+                last_watched
+                    .clone()
+                    .unwrap_or_else(|| latest_available.clone()),
+                false,
+            )
+        }
+        None => {
+            // No episode flag — use history / latest as the default selection.
+            (
+                last_watched
+                    .clone()
+                    .unwrap_or_else(|| latest_available.clone()),
+                false,
+            )
+        }
+    };
 
     loop {
         let default_idx = episodes
@@ -683,14 +721,21 @@ async fn play_show(
             .or_else(|| episodes.iter().position(|ep| ep == &latest_available))
             .unwrap_or(0);
 
-        let selection = Select::with_theme(&theme())
-            .with_prompt("Episode to play (Enter to select, Esc to cancel)")
-            .items(&episodes)
-            .default(default_idx)
-            .interact_opt()?;
-        let Some(idx) = selection else {
-            println!("Exiting playback loop.");
-            return Ok(());
+        // On the first iteration of a direct-jump, bypass the selection dialog.
+        let idx = if skip_selection {
+            skip_selection = false; // only skip once
+            default_idx
+        } else {
+            let selection = Select::with_theme(&theme())
+                .with_prompt("Episode to play (Enter to select, Esc to cancel)")
+                .items(&episodes)
+                .default(default_idx)
+                .interact_opt()?;
+            let Some(i) = selection else {
+                println!("Exiting playback loop.");
+                return Ok(());
+            };
+            i
         };
 
         let chosen = episodes[idx].clone();
