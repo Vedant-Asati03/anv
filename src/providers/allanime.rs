@@ -11,6 +11,7 @@ use crate::types::{
 const ALLANIME_API_URL: &str = "https://api.allanime.day/api";
 const ALLANIME_BASE_URL: &str = "https://allanime.day";
 const ALLANIME_REFERER: &str = "https://allmanga.to";
+const ALLANIME_IMAGE_REFERER: &str = "https://allanime.to";
 const ALLANIME_ORIGIN: &str = "https://allanime.day";
 const PREFERRED_PROVIDERS: &[&str] = &["Default", "S-mp4", "Luf-Mp4", "Yt-mp4"];
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36";
@@ -342,7 +343,8 @@ impl MangaProvider for AllAnimeClient {
                             format!("{}{}", head, p.url)
                         };
                         let mut headers = HashMap::new();
-                        headers.insert("Referer".to_string(), ALLANIME_REFERER.to_string());
+                        headers.insert("Referer".to_string(), ALLANIME_IMAGE_REFERER.to_string());
+                        headers.insert("Origin".to_string(), ALLANIME_IMAGE_REFERER.to_string());
                         Page { url, headers }
                     })
                     .collect()
