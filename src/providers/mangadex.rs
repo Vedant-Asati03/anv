@@ -38,31 +38,34 @@ impl MangaDexClient {
         for lang in languages {
             query.push(("translatedLanguage[]", lang.to_string()));
         }
-
         let url = format!("{}/manga/{}/feed", MANGADEX_API_URL, manga_id);
-        let response = self.client.get(&url).query(&query).send().await?;
 
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let wait = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(2);
-            tokio::time::sleep(Duration::from_secs(wait)).await;
-            bail!("MangaDex rate limited; retry after {}s", wait);
+        for _attempt in 1..=3u8 {
+            let response = self.client.get(&url).query(&query).send().await?;
+
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let wait = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(2);
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| String::from("<unreadable>"));
+                bail!("MangaDex API error: {} - {}", status, text);
+            }
+
+            return Ok(response.json().await?);
         }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| String::from("<unreadable>"));
-            bail!("MangaDex API error: {} - {}", status, text);
-        }
-
-        Ok(response.json().await?)
+        bail!("MangaDex rate limited after 3 attempts");
     }
 }
 
