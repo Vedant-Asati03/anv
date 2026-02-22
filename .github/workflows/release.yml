@@ -90,6 +90,30 @@ jobs:
           path: anv-${{ steps.crate_meta.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
           if-no-files-found: error
 
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout release tag (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        run: git checkout "refs/tags/${{ github.event.inputs.tag }}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Publish to crates.io
+        run: cargo publish --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
