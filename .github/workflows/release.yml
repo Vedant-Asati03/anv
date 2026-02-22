@@ -99,7 +99,11 @@ jobs:
         id: crate_meta
         shell: bash
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -n1 | cut -d'"' -f2)
+          # Derive version from the tag (e.g. v0.3.0 -> 0.3.0).
+          # Do NOT read Cargo.toml here: the checked-out tag may point to an
+          # older commit where Cargo.toml still has the previous version.
+          TAG="${{ env.RELEASE_TAG }}"
+          VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
@@ -185,6 +189,11 @@ jobs:
           find dist -type f -print -exec mv {} release-assets/ \;
           ls -lh release-assets
 
+      - name: Delete existing release if present
+        run: gh release delete "${{ steps.release_meta.outputs.tag }}" --yes || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -192,6 +201,5 @@ jobs:
           files: release-assets/*
           generate_release_notes: true
           make_latest: true
-          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
