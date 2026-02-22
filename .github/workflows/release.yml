@@ -178,7 +178,7 @@ jobs:
           ls -lh release-assets
 
       - name: Delete existing release if present
-        run: gh release delete "${{ steps.release_meta.outputs.tag }}" --yes || true
+        run: gh release delete "${{ steps.release_meta.outputs.tag }}" --yes 2>/dev/null || true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
