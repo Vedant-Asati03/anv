@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use regex::Regex;
 use reqwest::Client;
+use scraper::{Html, Selector};
 
-use super::MangaProvider;
-use crate::types::{ChapterCounts, MangaInfo, Page, Translation};
+use super::{MangaProvider, USER_AGENT};
+use crate::types::{Chapter, ChapterCounts, MangaInfo, Page, Translation};
 
 const MANGAPILL_BASE_URL: &str = "https://mangapill.com";
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36";
 
 pub struct MangapillClient {
     client: Client,
@@ -18,6 +17,12 @@ impl MangapillClient {
     pub fn new() -> Result<Self> {
         let client = Client::builder().user_agent(USER_AGENT).build()?;
         Ok(Self { client })
+    }
+}
+
+impl Default for MangapillClient {
+    fn default() -> Self {
+        Self::new().expect("failed to build HTTP client")
     }
 }
 
@@ -35,24 +40,30 @@ impl MangaProvider for MangapillClient {
         }
 
         let text = response.text().await?;
+        let doc = Html::parse_document(&text);
 
-        // Regex to find manga in search results
-        // <a href="/manga/2085/jujutsu-kaisen" class="mb-2">
-        //     <div class="mt-3 font-black leading-tight line-clamp-2">Jujutsu Kaisen</div>
-        let re = Regex::new(r#"href="/manga/(\d+)/([^"]+)"[^>]*>\s*<div[^>]*>([^<]+)</div>"#)?;
+        let link_sel = Selector::parse(r#"a[href^="/manga/"]"#).expect("valid CSS selector");
+        let title_sel = Selector::parse("div.font-black, div.mt-3").expect("valid CSS selector");
 
         let mut mangas = Vec::new();
-        for cap in re.captures_iter(&text) {
-            let id_num = &cap[1];
-            let slug = &cap[2];
-            let title = &cap[3];
-
-            // We combine id_num and slug for the ID
-            let id = format!("{}/{}", id_num, slug);
-
+        for link in doc.select(&link_sel) {
+            let href = link.value().attr("href").unwrap_or_default();
+            let trimmed = href.trim_start_matches("/manga/");
+            if trimmed.is_empty() {
+                continue;
+            }
+            let title = link
+                .select(&title_sel)
+                .next()
+                .map(|el| el.text().collect::<String>())
+                .unwrap_or_default();
+            let title = title.trim().to_string();
+            if title.is_empty() {
+                continue;
+            }
             mangas.push(MangaInfo {
-                id,
-                title: title.trim().to_string(),
+                id: trimmed.to_string(),
+                title,
                 available_chapters: ChapterCounts::default(),
             });
         }
@@ -64,7 +75,7 @@ impl MangaProvider for MangapillClient {
         &self,
         manga_id: &str,
         _translation: Translation,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<Chapter>> {
         // manga_id is like "2085/jujutsu-kaisen"
         let url = format!("{}/manga/{}", MANGAPILL_BASE_URL, manga_id);
         let response = self.client.get(&url).send().await?;
@@ -74,79 +85,60 @@ impl MangaProvider for MangapillClient {
         }
 
         let text = response.text().await?;
+        let doc = Html::parse_document(&text);
 
-        // Regex for chapters
-        // <a href="/chapters/2085-10271500/jujutsu-kaisen-chapter-271.5" ...>Chapter 271.5</a>
-        let re = Regex::new(r#"href="/chapters/([^"]+)"[^>]*>([^<]+)</a>"#)?;
+        let sel = Selector::parse(r#"a[href^="/chapters/"]"#).expect("valid CSS selector");
 
-        let mut chapters = Vec::new();
-        for cap in re.captures_iter(&text) {
-            let _slug = &cap[1]; // e.g. 2085-10271500/jujutsu-kaisen-chapter-271.5
-            let title = &cap[2]; // e.g. Chapter 271.5
-
-            // We extract the number from the title
-            // "Chapter 271.5" -> "271.5"
-            let num = title.replace("Chapter ", "").trim().to_string();
-            chapters.push(num);
+        let mut chapters: Vec<Chapter> = Vec::new();
+        for el in doc.select(&sel) {
+            let href = el.value().attr("href").unwrap_or_default();
+            let slug = href.trim_start_matches("/chapters/").to_string();
+            let text: String = el.text().collect();
+            let label = text.replace("Chapter ", "").trim().to_string();
+            if label.is_empty() || slug.is_empty() {
+                continue;
+            }
+            chapters.push(Chapter { id: slug, label });
         }
 
-        // Sort numerically
         chapters.sort_by(|a, b| {
-            let a_num = a.parse::<f32>().unwrap_or(0.0);
-            let b_num = b.parse::<f32>().unwrap_or(0.0);
+            let a_num = a.label.parse::<f64>().unwrap_or(0.0);
+            let b_num = b.label.parse::<f64>().unwrap_or(0.0);
             a_num
                 .partial_cmp(&b_num)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        chapters.dedup();
+        chapters.dedup_by(|a, b| a.label == b.label);
 
         Ok(chapters)
     }
 
     async fn fetch_pages(
         &self,
-        manga_id: &str,
+        _manga_id: &str,
         _translation: Translation,
-        chapter: &str,
+        chapter_id: &str,
     ) -> Result<Vec<Page>> {
-        // We need to find the chapter slug again because we only stored the number.
-        // This is inefficient but required by the trait signature.
-
-        let url = format!("{}/manga/{}", MANGAPILL_BASE_URL, manga_id);
+        let url = format!("{}/chapters/{}", MANGAPILL_BASE_URL, chapter_id);
         let response = self.client.get(&url).send().await?;
-        let text = response.text().await?;
 
-        // Find the chapter link for this number
-        // We look for >Chapter {chapter}<
-        let pattern = format!(
-            r#"href="/chapters/([^"]+)"[^>]*>Chapter {}</a>"#,
-            regex::escape(chapter)
-        );
-        let re = Regex::new(&pattern)?;
-
-        let chapter_slug = if let Some(cap) = re.captures(&text) {
-            cap[1].to_string()
-        } else {
-            // Try fuzzy match or just fail
-            bail!("Chapter {} not found", chapter);
-        };
-
-        let url = format!("{}/chapters/{}", MANGAPILL_BASE_URL, chapter_slug);
-        let response = self.client.get(&url).send().await?;
-        let text = response.text().await?;
-
-        // Regex for images
-        // <img class="js-page" data-src="([^"]+)"
-        let re = Regex::new(r#"data-src="([^"]+)""#)?;
-
-        let mut pages = Vec::new();
-        for cap in re.captures_iter(&text) {
-            let url = cap[1].to_string();
-            pages.push(Page {
-                url,
-                headers: HashMap::new(),
-            });
+        if !response.status().is_success() {
+            bail!("Mangapill chapter error: {}", response.status());
         }
+
+        let text = response.text().await?;
+        let doc = Html::parse_document(&text);
+
+        let sel = Selector::parse("img.js-page[data-src]").expect("valid CSS selector");
+
+        let pages = doc
+            .select(&sel)
+            .filter_map(|el| el.value().attr("data-src"))
+            .map(|src| Page {
+                url: src.to_string(),
+                headers: HashMap::new(),
+            })
+            .collect();
 
         Ok(pages)
     }
