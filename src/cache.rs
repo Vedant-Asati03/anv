@@ -8,9 +8,9 @@ use std::{
     process::Command,
 };
 
+use crate::providers::USER_AGENT;
 use crate::types::{Page, Translation};
 
-pub const CACHE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36";
 pub const CACHE_ACCEPT: &str = "image/avif,image/webp,image/*,*/*;q=0.8";
 
 pub struct MangaCacheState {
@@ -21,14 +21,8 @@ pub struct MangaCacheState {
 
 pub fn build_cache_http_client() -> Result<Client> {
     Client::builder()
-        .user_agent(CACHE_USER_AGENT)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() > 5 {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        }))
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to create cache HTTP client")
 }
@@ -198,7 +192,7 @@ pub fn download_page_curl(page: &Page, file: &Path) -> Result<()> {
         .arg("--show-error")
         .arg("--location-trusted")
         .arg("--user-agent")
-        .arg(CACHE_USER_AGENT)
+        .arg(USER_AGENT)
         .arg("--header")
         .arg(format!("Accept: {CACHE_ACCEPT}"));
     for (key, value) in &page.headers {
@@ -251,21 +245,19 @@ pub fn sanitize_cache_segment(value: &str) -> String {
     }
 }
 
-pub fn infer_page_extension(url: &str) -> String {
+pub fn infer_page_extension(url: &str) -> &'static str {
     let path = url.split('?').next().unwrap_or(url);
-    match path.rsplit('.').next().map(|s| s.to_ascii_lowercase()) {
-        Some(ext)
-            if matches!(
-                ext.as_str(),
-                "jpg" | "jpeg" | "png" | "webp" | "avif" | "gif"
-            ) =>
-        {
-            if ext == "jpeg" {
-                String::from("jpg")
-            } else {
-                ext
-            }
-        }
-        _ => String::from("jpg"),
+    match path
+        .rsplit('.')
+        .next()
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "jpg",
+        Some("png") => "png",
+        Some("webp") => "webp",
+        Some("avif") => "avif",
+        Some("gif") => "gif",
+        _ => "jpg",
     }
 }
