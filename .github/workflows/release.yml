@@ -22,10 +22,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout release tag (manual run)
-        if: github.event_name == 'workflow_dispatch'
-        run: git checkout "refs/tags/${{ github.event.inputs.tag }}"
-
       - name: Check tag matches Cargo.toml version
         shell: bash
         run: |
