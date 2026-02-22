@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt};
 
@@ -90,4 +91,13 @@ impl StreamOption {
 pub struct Page {
     pub url: String,
     pub headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Allanime,
+    Mangadex,
+    Mangapill,
 }
