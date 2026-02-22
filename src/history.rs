@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::types::Translation;
+use crate::types::{Provider, Translation};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HistoryEntry {
@@ -16,6 +16,8 @@ pub struct HistoryEntry {
     pub show_title: String,
     pub episode: String,
     pub translation: Translation,
+    #[serde(default)]
+    pub provider: Provider,
     #[serde(default)]
     pub is_manga: bool,
     pub watched_at: DateTime<Utc>,
