@@ -1,111 +1,37 @@
 use std::{
     cmp::Ordering,
-    fs,
-    io::{BufRead, BufReader, Write},
-    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::Command,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
-    },
-    thread,
-    time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
-use clap::Parser;
-use dialoguer::{Select, theme::ColorfulTheme};
-use dirs_next::{cache_dir, data_dir};
-use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use anyhow::{Result, bail};
+use chrono::Utc;
+use clap::{Parser, ValueEnum};
+use dialoguer::Select;
+use reqwest::StatusCode;
 
+mod cache;
+mod history;
+mod player;
 mod providers;
+mod proxy;
 mod types;
 
+use cache::{MangaCacheState, cache_manga_pages};
+use history::{History, HistoryEntry, history_path, theme};
+use player::{choose_stream, launch_image_viewer, launch_player};
 use providers::{
     AnimeProvider, MangaProvider, allanime::AllAnimeClient, mangadex::MangaDexClient,
     mangapill::MangapillClient,
 };
-use types::{ChapterCounts, EpisodeCounts, MangaInfo, Page, ShowInfo, StreamOption, Translation};
+use types::{ChapterCounts, EpisodeCounts, MangaInfo, ShowInfo, Translation};
 
-const PLAYER_ENV_KEY: &str = "ANV_PLAYER";
 const INITIAL_MANGA_PAGE_PRELOAD: usize = 5;
-const CACHE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36";
-const CACHE_ACCEPT: &str = "image/avif,image/webp,image/*,*/*;q=0.8";
 
-#[derive(Clone)]
-struct CachedPageTarget {
-    page: Page,
-    path: PathBuf,
-}
-
-struct LocalPageProxy {
-    base_url: String,
-    stop: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl LocalPageProxy {
-    fn start(targets: Vec<CachedPageTarget>) -> Result<Self> {
-        let listener =
-            TcpListener::bind(("127.0.0.1", 0)).context("failed to bind local page cache proxy")?;
-        let addr = listener
-            .local_addr()
-            .context("failed to read local proxy address")?;
-        listener
-            .set_nonblocking(true)
-            .context("failed to configure local proxy socket")?;
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_signal = Arc::clone(&stop);
-        let handle = thread::spawn(move || {
-            while !stop_signal.load(AtomicOrdering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        if let Err(err) = handle_proxy_request(&mut stream, &targets) {
-                            if is_benign_proxy_error(&err) {
-                                continue;
-                            }
-                            let _ = write_http_error(&mut stream, 500, "proxy error");
-                            println!("Local cache proxy request failed: {}", err);
-                        }
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(25));
-                    }
-                    Err(err) => {
-                        println!("Local cache proxy accept failed: {}", err);
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                }
-            }
-        });
-
-        Ok(Self {
-            base_url: format!("http://127.0.0.1:{}", addr.port()),
-            stop,
-            handle: Some(handle),
-        })
-    }
-
-    fn page_url(&self, idx: usize) -> String {
-        format!("{}/{}", self.base_url, idx)
-    }
-
-    fn shutdown(&mut self) {
-        self.stop.store(true, AtomicOrdering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for LocalPageProxy {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
+#[derive(Debug, Clone, ValueEnum)]
+enum Provider {
+    Allanime,
+    Mangadex,
+    Mangapill,
 }
 
 #[derive(Debug, Parser)]
@@ -115,126 +41,16 @@ struct Cli {
     dub: bool,
     #[arg(long)]
     history: bool,
-
     #[arg(long)]
     manga: bool,
-
-    #[arg(long, default_value = "allanime")]
-    provider: String,
-
+    #[arg(long, default_value = "allanime", value_enum)]
+    provider: Provider,
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
-
     #[arg(short = 'e', long, value_name = "EPISODE")]
     episode: Option<String>,
-
     #[arg(value_name = "QUERY")]
     query: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct HistoryEntry {
-    show_id: String,
-    show_title: String,
-    episode: String,
-    translation: Translation,
-    #[serde(default)]
-    is_manga: bool,
-    watched_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct History {
-    entries: Vec<HistoryEntry>,
-}
-
-impl History {
-    fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let data = fs::read_to_string(path)
-            .with_context(|| format!("failed to read history file {}", path.display()))?;
-        let history = serde_json::from_str(&data)
-            .with_context(|| format!("failed to parse history file {}", path.display()))?;
-        Ok(history)
-    }
-
-    fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create history directory {}", parent.display())
-            })?;
-        }
-        let data = serde_json::to_string_pretty(self)?;
-        fs::write(path, data)
-            .with_context(|| format!("failed to write history file {}", path.display()))?;
-        Ok(())
-    }
-
-    fn upsert(&mut self, entry: HistoryEntry) {
-        if let Some(pos) = self.entries.iter().position(|e| {
-            e.show_id == entry.show_id
-                && e.translation == entry.translation
-                && e.is_manga == entry.is_manga
-        }) {
-            self.entries.remove(pos);
-        }
-        self.entries.insert(0, entry);
-    }
-
-    fn last_episode(&self, show_id: &str, translation: Translation) -> Option<String> {
-        self.entries
-            .iter()
-            .find(|e| e.show_id == show_id && e.translation == translation && !e.is_manga)
-            .map(|e| e.episode.clone())
-    }
-
-    fn last_chapter(&self, show_id: &str, translation: Translation) -> Option<String> {
-        self.entries
-            .iter()
-            .find(|e| e.show_id == show_id && e.translation == translation && e.is_manga)
-            .map(|e| e.episode.clone())
-    }
-
-    fn select_entry(&self) -> Result<Option<HistoryEntry>> {
-        if self.entries.is_empty() {
-            println!("History is empty.");
-            return Ok(None);
-        }
-
-        let theme = theme();
-        let items: Vec<String> = self
-            .entries
-            .iter()
-            .map(|entry| {
-                let tag = if entry.is_manga {
-                    if entry.translation == Translation::Raw {
-                        "Raw"
-                    } else {
-                        "Man"
-                    }
-                } else {
-                    entry.translation.label()
-                };
-                format!(
-                    "[{}] {} · {} {} · watched {}",
-                    tag,
-                    entry.show_title,
-                    if entry.is_manga { "chapter" } else { "episode" },
-                    entry.episode,
-                    entry.watched_at.format("%Y-%m-%d %H:%M")
-                )
-            })
-            .collect();
-
-        let selection = Select::with_theme(&theme)
-            .with_prompt("Select an entry to replay (Esc to cancel)")
-            .items(&items)
-            .default(0)
-            .interact_opt()?;
-        Ok(selection.map(|idx| self.entries[idx].clone()))
-    }
 }
 
 #[tokio::main]
@@ -248,30 +64,27 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let history_mode =
-        cli.history || (cli.query.len() == 1 && cli.query[0].eq_ignore_ascii_case("history"));
     let history_path = history_path()?;
     let mut history = History::load(&history_path)?;
 
     if cli.manga {
         let translation = Translation::Sub;
-        match cli.provider.to_lowercase().as_str() {
-            "allanime" => {
+        match cli.provider {
+            Provider::Allanime => {
                 let client = AllAnimeClient::new()?;
                 return run_manga_flow(&cli, translation, &mut history, &history_path, &client)
                     .await;
             }
-            "mangadex" => {
+            Provider::Mangadex => {
                 let client = MangaDexClient::new()?;
                 return run_manga_flow(&cli, translation, &mut history, &history_path, &client)
                     .await;
             }
-            "mangapill" => {
+            Provider::Mangapill => {
                 let client = MangapillClient::new()?;
                 return run_manga_flow(&cli, translation, &mut history, &history_path, &client)
                     .await;
             }
-            _ => bail!("Unknown provider: {}", cli.provider),
         }
     }
 
@@ -281,10 +94,10 @@ async fn run() -> Result<()> {
         Translation::Sub
     };
 
-    if cli.provider.to_lowercase() != "allanime" {
-        println!("Warning: Only 'allanime' provider supports anime. Switching to 'allanime'.");
+    if !matches!(cli.provider, Provider::Allanime) {
+        eprintln!("Warning: Only 'allanime' provider supports anime. Switching to 'allanime'.");
     }
-    run_anime_flow(&cli, translation, history_mode, &mut history, &history_path).await
+    run_anime_flow(&cli, translation, cli.history, &mut history, &history_path).await
 }
 
 async fn run_manga_flow(
@@ -312,7 +125,7 @@ async fn run_manga_flow(
             let count = match translation {
                 Translation::Sub => m.available_chapters.sub,
                 Translation::Raw => m.available_chapters.raw,
-                _ => 0,
+                Translation::Dub => 0,
             };
             format!("{} [{} chapters]", m.title, count)
         })
@@ -357,7 +170,7 @@ async fn read_manga(
                 || msg.contains("connect")
             {
                 bail!(
-                    "Could not connect to the provider — your network may be blocking it.\nTry a different provider: --provider mangadex  or  --provider mangapill"
+                    "Could not connect to the provider \u{2014} your network may be blocking it.\nTry a different provider: --provider mangadex  or  --provider mangapill"
                 );
             }
             return Err(err);
@@ -371,11 +184,13 @@ async fn read_manga(
         );
     }
 
-    let latest_available = chapters
-        .iter()
-        .max_by(|a, b| compare_episode_labels(a, b))
+    let chapter_labels: Vec<String> = chapters.iter().map(|c| c.label.clone()).collect();
+    let sorted_labels = sorted_episode_labels(&chapter_labels);
+
+    let latest_available = sorted_labels
+        .last()
         .cloned()
-        .unwrap_or_else(|| String::from("1"));
+        .expect("chapters is non-empty; bail!() above ensures this");
     println!(
         "Found {} {} chapters. Latest available: {}.",
         chapters.len(),
@@ -389,8 +204,8 @@ async fn read_manga(
     }
 
     let fallback = last_read.unwrap_or_else(|| latest_available.clone());
-    let (mut current_chapter, mut skip_selection) = match &prefer_chapter {
-        Some(ch) if chapters.contains(ch) => (ch.clone(), true),
+    let (mut current_label, mut skip_selection) = match &prefer_chapter {
+        Some(ch) if chapter_labels.contains(ch) => (ch.clone(), true),
         Some(ch) => {
             println!(
                 "Chapter '{}' does not exist for '{}'. Showing chapter list.",
@@ -401,20 +216,21 @@ async fn read_manga(
         None => (fallback, false),
     };
 
+    let theme = theme();
     loop {
-        let default_idx = chapters
+        let default_idx = chapter_labels
             .iter()
-            .position(|ch| ch == &current_chapter)
-            .or_else(|| chapters.iter().position(|ch| ch == &latest_available))
+            .position(|ch| ch == &current_label)
+            .or_else(|| chapter_labels.iter().position(|ch| ch == &latest_available))
             .unwrap_or(0);
 
         let idx = if skip_selection {
             skip_selection = false;
             default_idx
         } else {
-            let selection = Select::with_theme(&theme())
+            let selection = Select::with_theme(&theme)
                 .with_prompt("Chapter to read (Enter to select, Esc to cancel)")
-                .items(&chapters)
+                .items(&chapter_labels)
                 .default(default_idx)
                 .interact_opt()?;
             let Some(i) = selection else {
@@ -424,29 +240,37 @@ async fn read_manga(
             i
         };
 
-        let chosen = chapters[idx].clone();
+        let chosen_label = chapter_labels[idx].clone();
+        let chapter_id = chapters[idx].id.clone();
         let auto_advance = idx == default_idx;
 
-        let pages = match client.fetch_pages(&manga.id, translation, &chosen).await {
+        let pages = match client
+            .fetch_pages(&manga.id, translation, &chapter_id)
+            .await
+        {
             Ok(pages) => pages,
             Err(err) => {
-                println!("Failed to fetch pages for chapter {}: {}", chosen, err);
+                eprintln!(
+                    "Failed to fetch pages for chapter {}: {}",
+                    chosen_label, err
+                );
                 continue;
             }
         };
 
         if pages.is_empty() {
-            println!("No pages found for chapter {}.", chosen);
+            eprintln!("No pages found for chapter {}.", chosen_label);
             continue;
         }
 
-        let next_candidate = next_episode_label(&chosen, &chapters);
+        let next_candidate = next_episode_label_presorted(&chosen_label, &sorted_labels);
         let cache_state = match cache_manga_pages(
             &pages,
             &manga.id,
             translation,
-            &chosen,
+            &chosen_label,
             cache_base_override,
+            INITIAL_MANGA_PAGE_PRELOAD,
         )
         .await
         {
@@ -457,7 +281,7 @@ async fn read_manga(
                     println!(
                         "Cached {cached_count}/{} pages upfront for Chapter {} (first {} pages).",
                         pages.len(),
-                        chosen,
+                        chosen_label,
                         INITIAL_MANGA_PAGE_PRELOAD
                     );
                     if pages.len() > INITIAL_MANGA_PAGE_PRELOAD {
@@ -467,9 +291,9 @@ async fn read_manga(
                 state
             }
             Err(err) => {
-                println!(
+                eprintln!(
                     "Page cache unavailable for Chapter {} ({}). Falling back to streaming URLs.",
-                    chosen, err
+                    chosen_label, err
                 );
                 MangaCacheState {
                     cached_pages: vec![None; pages.len()],
@@ -480,9 +304,10 @@ async fn read_manga(
         };
 
         if cache_state.cdn_blocked {
-            match (auto_advance, next_candidate) {
-                (true, Some(next)) => current_chapter = next,
-                _ => {}
+            if auto_advance {
+                if let Some(next) = next_candidate {
+                    current_label = next;
+                }
             }
             continue;
         }
@@ -492,13 +317,14 @@ async fn read_manga(
             &cache_state.cached_pages,
             &cache_state.cache_files,
             &manga.title,
-            &chosen,
-        )?;
+            &chosen_label,
+        )
+        .await?;
 
         history.upsert(HistoryEntry {
             show_id: manga.id.clone(),
             show_title: manga.title.clone(),
-            episode: chosen.clone(),
+            episode: chosen_label.clone(),
             translation,
             is_manga: true,
             watched_at: Utc::now(),
@@ -506,88 +332,13 @@ async fn read_manga(
         history.save(history_path)?;
 
         match (auto_advance, next_candidate) {
-            (true, Some(next)) => current_chapter = next,
+            (true, Some(next)) => current_label = next,
             (true, None) => {
                 println!("No further chapters found. Exiting.");
                 return Ok(());
             }
-            (false, candidate) => current_chapter = candidate.unwrap_or(chosen),
+            (false, candidate) => current_label = candidate.unwrap_or(chosen_label),
         }
-    }
-}
-
-fn launch_image_viewer(
-    pages: &[Page],
-    cached_pages: &[Option<PathBuf>],
-    cache_files: &[PathBuf],
-    title: &str,
-    chapter: &str,
-) -> Result<()> {
-    let player = detect_player();
-    let mut cmd = Command::new(&player);
-    let media_title = format!("{title} - Chapter {chapter}");
-    cmd.arg("--quiet");
-    cmd.arg("--terminal=no");
-    cmd.arg(format!("--force-media-title={media_title}"));
-    cmd.arg("--image-display-duration=inf");
-
-    if !cached_pages.iter().any(|p| p.is_some()) {
-        add_direct_url_args(&mut cmd, pages);
-    } else if cached_pages.iter().all(|p| p.is_some()) {
-        for path in cached_pages.iter().flatten() {
-            cmd.arg(path);
-        }
-    } else {
-        let targets: Vec<CachedPageTarget> = pages
-            .iter()
-            .cloned()
-            .zip(cache_files.iter().cloned())
-            .map(|(page, path)| CachedPageTarget { page, path })
-            .collect();
-        match LocalPageProxy::start(targets) {
-            Ok(mut proxy) => {
-                for idx in 0..pages.len() {
-                    cmd.arg(proxy.page_url(idx));
-                }
-                println!("Launching viewer for Chapter {}...", chapter);
-                let status = cmd.status().context("failed to launch viewer")?;
-                proxy.shutdown();
-                if !status.success() {
-                    bail!("viewer exited with status {status}");
-                }
-                return Ok(());
-            }
-            Err(err) => {
-                println!(
-                    "Local cache proxy unavailable ({}). Falling back to direct URLs.",
-                    err
-                );
-                add_direct_url_args(&mut cmd, pages);
-            }
-        }
-    }
-
-    println!("Launching viewer for Chapter {}...", chapter);
-    let status = cmd.status().context("failed to launch viewer")?;
-    if !status.success() && status.code() != Some(2) {
-        bail!("viewer exited with status {status}");
-    }
-    Ok(())
-}
-
-fn add_direct_url_args(cmd: &mut Command, pages: &[Page]) {
-    if let Some(first) = pages.first() {
-        for (key, value) in &first.headers {
-            if key.eq_ignore_ascii_case("referer") {
-                cmd.arg(format!("--referrer={value}"));
-                cmd.arg(format!("--http-header-fields=Referer: {value}"));
-            } else {
-                cmd.arg(format!("--http-header-fields={}: {value}", key));
-            }
-        }
-    }
-    for page in pages {
-        cmd.arg(&page.url);
     }
 }
 
@@ -654,7 +405,7 @@ async fn run_anime_flow(
             let count = match translation {
                 Translation::Sub => s.available_eps.sub,
                 Translation::Dub => s.available_eps.dub,
-                _ => 0,
+                Translation::Raw => 0,
             };
             format!("{} [{} episodes]", s.title, count)
         })
@@ -697,11 +448,12 @@ async fn play_show(
         );
     }
 
-    let latest_available = episodes
-        .iter()
-        .max_by(|a, b| compare_episode_labels(a, b))
+    let sorted_episodes = sorted_episode_labels(&episodes);
+
+    let latest_available = sorted_episodes
+        .last()
         .cloned()
-        .unwrap_or_else(|| String::from("1"));
+        .expect("episodes is non-empty; bail!() above ensures this");
     println!(
         "Found {} {} episodes. Latest available: {}.",
         episodes.len(),
@@ -727,6 +479,7 @@ async fn play_show(
         None => (fallback, false),
     };
 
+    let theme = theme();
     loop {
         let default_idx = episodes
             .iter()
@@ -738,7 +491,7 @@ async fn play_show(
             skip_selection = false;
             default_idx
         } else {
-            let selection = Select::with_theme(&theme())
+            let selection = Select::with_theme(&theme)
                 .with_prompt("Episode to play (Enter to select, Esc to cancel)")
                 .items(&episodes)
                 .default(default_idx)
@@ -759,7 +512,7 @@ async fn play_show(
             Err(err) => {
                 if let Some(req_err) = err.downcast_ref::<reqwest::Error>() {
                     if req_err.status() == Some(StatusCode::BAD_REQUEST) {
-                        println!(
+                        eprintln!(
                             "Episode {chosen} is not yet available for {} translation.",
                             translation.label()
                         );
@@ -767,13 +520,13 @@ async fn play_show(
                         continue;
                     }
                 }
-                println!("Error fetching streams: {}", err);
+                eprintln!("Error fetching streams: {}", err);
                 continue;
             }
         };
 
         if streams.is_empty() {
-            println!(
+            eprintln!(
                 "No supported streams found for episode {chosen}. Try another episode or rerun later."
             );
             current_episode = latest_available.clone();
@@ -788,9 +541,9 @@ async fn play_show(
             }
         };
 
-        let next_candidate = next_episode_label(&chosen, &episodes);
+        let next_candidate = next_episode_label_presorted(&chosen, &sorted_episodes);
 
-        launch_player(&stream, &show.title, &chosen)?;
+        launch_player(&stream, &show.title, &chosen).await?;
 
         history.upsert(HistoryEntry {
             show_id: show.id.clone(),
@@ -812,80 +565,14 @@ async fn play_show(
     }
 }
 
-fn choose_stream(mut options: Vec<StreamOption>) -> Result<StreamOption> {
-    if options.len() == 1 {
-        return Ok(options.remove(0));
-    }
-    let theme = theme();
-    let labels: Vec<String> = options.iter().map(StreamOption::label).collect();
-    let selection = Select::with_theme(&theme)
-        .with_prompt("Select a stream")
-        .items(&labels)
-        .default(0)
-        .interact_opt()?;
-    let Some(idx) = selection else {
-        bail!("Stream selection cancelled.");
-    };
-    Ok(options.remove(idx))
-}
-
-fn launch_player(stream: &StreamOption, title: &str, episode: &str) -> Result<()> {
-    let player = detect_player();
-    let mut cmd = Command::new(&player);
-    let media_title = format!("{title} - Episode {episode}");
-    cmd.arg("--quiet");
-    cmd.arg("--terminal=no");
-    cmd.arg(format!("--force-media-title={media_title}"));
-    if let Some(sub) = &stream.subtitle {
-        cmd.arg(format!("--sub-file={sub}"));
-    }
-    for (key, value) in &stream.headers {
-        if key.eq_ignore_ascii_case("user-agent") {
-            cmd.arg(format!("--user-agent={value}"));
-        } else if key.eq_ignore_ascii_case("referer") {
-            cmd.arg(format!("--referrer={value}"));
-            cmd.arg(format!("--http-header-fields=Referer: {value}"));
-        } else {
-            cmd.arg(format!("--http-header-fields={}: {value}", key));
-        }
-    }
-    cmd.arg(&stream.url);
-
-    let status = match cmd.status() {
-        Ok(status) => status,
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return Err(anyhow!(
-                    "Player '{}' not found. Install mpv or set {} to a valid command.",
-                    player,
-                    PLAYER_ENV_KEY
-                ));
-            }
-            return Err(anyhow!(err).context(format!("failed to launch player '{player}'")));
-        }
-    };
-
-    if !status.success() {
-        bail!("player exited with status {status}");
-    }
-    Ok(())
-}
-
-fn detect_player() -> String {
-    std::env::var(PLAYER_ENV_KEY)
-        .ok()
-        .filter(|val| !val.trim().is_empty())
-        .unwrap_or_else(|| "mpv".to_string())
-}
-
 fn compare_episode_labels(left: &str, right: &str) -> Ordering {
     let l = parse_episode_key(left);
     let r = parse_episode_key(right);
     l.partial_cmp(&r).unwrap_or(Ordering::Equal)
 }
 
-fn parse_episode_key(label: &str) -> f32 {
-    label.parse::<f32>().unwrap_or(0.0)
+fn parse_episode_key(label: &str) -> f64 {
+    label.parse::<f64>().unwrap_or(0.0)
 }
 
 fn sorted_episode_labels(episodes: &[String]) -> Vec<String> {
@@ -895,422 +582,7 @@ fn sorted_episode_labels(episodes: &[String]) -> Vec<String> {
     sorted
 }
 
-fn next_episode_label(current: &str, episodes: &[String]) -> Option<String> {
-    let sorted = sorted_episode_labels(episodes);
+fn next_episode_label_presorted(current: &str, sorted: &[String]) -> Option<String> {
     let pos = sorted.iter().position(|ep| ep == current)?;
     sorted.get(pos + 1).cloned()
-}
-
-struct MangaCacheState {
-    cached_pages: Vec<Option<PathBuf>>,
-    cache_files: Vec<PathBuf>,
-    cdn_blocked: bool,
-}
-
-async fn cache_manga_pages(
-    pages: &[Page],
-    manga_id: &str,
-    translation: Translation,
-    chapter: &str,
-    cache_base_override: Option<&Path>,
-) -> Result<MangaCacheState> {
-    let chapter_dir = manga_cache_chapter_dir(manga_id, translation, chapter, cache_base_override)?;
-    fs::create_dir_all(&chapter_dir)
-        .with_context(|| format!("failed to create cache directory {}", chapter_dir.display()))?;
-
-    let preload_target = INITIAL_MANGA_PAGE_PRELOAD.min(pages.len());
-    let cache_files: Vec<PathBuf> = pages
-        .iter()
-        .enumerate()
-        .map(|(idx, page)| {
-            let ext = infer_page_extension(&page.url);
-            chapter_dir.join(format!("{:04}.{}", idx + 1, ext))
-        })
-        .collect();
-
-    let http = build_cache_http_client()?;
-    let mut cached = vec![None; pages.len()];
-
-    for idx in 0..preload_target {
-        let page = &pages[idx];
-        let file = &cache_files[idx];
-
-        if file.exists() {
-            cached[idx] = Some(file.clone());
-            continue;
-        }
-
-        match download_page(&http, page, file).await {
-            Ok(()) => cached[idx] = Some(file.clone()),
-            Err(err) => {
-                let msg = err.to_string();
-                if msg.contains("403") || msg.contains("Forbidden") {
-                    println!(
-                        "Image CDN returned 403 — this domain is blocked on your network.\n\
-                         Try a different provider: --provider mangadex  or  --provider mangapill"
-                    );
-                    return Ok(MangaCacheState {
-                        cached_pages: cached,
-                        cache_files,
-                        cdn_blocked: true,
-                    });
-                } else {
-                    println!("Cache miss for {}: {}", page.url, err);
-                    break;
-                }
-            }
-        }
-    }
-
-    if !cached.iter().any(|p| p.is_some()) {
-        return Ok(MangaCacheState {
-            cached_pages: cached,
-            cache_files,
-            cdn_blocked: false,
-        });
-    }
-
-    let mut background_jobs: Vec<(Page, PathBuf)> = Vec::new();
-    for idx in preload_target..pages.len() {
-        let file = &cache_files[idx];
-        if file.exists() {
-            cached[idx] = Some(file.clone());
-            continue;
-        }
-        background_jobs.push((pages[idx].clone(), file.clone()));
-    }
-
-    if !background_jobs.is_empty() {
-        std::thread::spawn(move || {
-            for (page, file) in background_jobs {
-                if file.exists() {
-                    continue;
-                }
-                if let Err(err) = download_page_curl(&page, &file) {
-                    let msg = err.to_string();
-                    if msg.contains("403") || msg.contains("exit status: 22") {
-                        break;
-                    }
-                    println!("Background cache miss for {}: {}", page.url, err);
-                }
-            }
-        });
-    }
-
-    Ok(MangaCacheState {
-        cached_pages: cached,
-        cache_files,
-        cdn_blocked: false,
-    })
-}
-
-async fn download_page(http: &Client, page: &Page, file: &Path) -> Result<()> {
-    match download_page_reqwest(http, page, file).await {
-        Ok(()) => Ok(()),
-        Err(primary_err) => download_page_curl(page, file)
-            .with_context(|| format!("reqwest failed first: {primary_err}")),
-    }
-}
-
-fn build_cache_http_client() -> Result<Client> {
-    Client::builder()
-        .user_agent(CACHE_USER_AGENT)
-        .danger_accept_invalid_certs(true)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            // Follow redirects but keep custom headers (don't strip on cross-origin).
-            if attempt.previous().len() > 5 {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-        .context("failed to create cache HTTP client")
-}
-
-fn handle_proxy_request(stream: &mut TcpStream, targets: &[CachedPageTarget]) -> Result<()> {
-    let mut reader = BufReader::new(stream.try_clone().context("failed to clone proxy stream")?);
-    let mut request_line = String::new();
-    let bytes_read = reader
-        .read_line(&mut request_line)
-        .context("failed to read proxy request")?;
-    if bytes_read == 0 {
-        return Ok(());
-    }
-
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let path = parts.next().unwrap_or_default();
-    if method != "GET" && method != "HEAD" {
-        write_http_error(stream, 405, "method not allowed")?;
-        return Ok(());
-    }
-
-    let idx = path
-        .trim_start_matches('/')
-        .split('?')
-        .next()
-        .unwrap_or_default()
-        .parse::<usize>()
-        .ok();
-    let Some(idx) = idx else {
-        write_http_error(stream, 404, "not found")?;
-        return Ok(());
-    };
-
-    let Some(target) = targets.get(idx) else {
-        write_http_error(stream, 404, "not found")?;
-        return Ok(());
-    };
-
-    if !target.path.exists()
-        && let Err(err) = download_page_curl(&target.page, &target.path)
-    {
-        write_http_error(stream, 502, "cache fetch failed")?;
-        return Err(err.context(format!(
-            "failed to fetch page {} for proxy",
-            target.page.url
-        )));
-    }
-
-    let data = fs::read(&target.path)
-        .with_context(|| format!("failed to read cached file {}", target.path.display()))?;
-    if method == "HEAD" {
-        write_http_head(stream, data.len(), mime_type_for_path(&target.path))?;
-    } else {
-        write_http_ok(stream, &data, mime_type_for_path(&target.path))?;
-    }
-    Ok(())
-}
-
-fn write_http_ok(stream: &mut TcpStream, body: &[u8], content_type: &str) -> Result<()> {
-    if let Err(err) = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
-        body.len(),
-        content_type
-    ) {
-        if is_benign_disconnect(&err) {
-            return Ok(());
-        }
-        return Err(err).context("failed to write proxy headers");
-    }
-    if let Err(err) = stream.write_all(body) {
-        if is_benign_disconnect(&err) {
-            return Ok(());
-        }
-        return Err(err).context("failed to write proxy response body");
-    }
-    Ok(())
-}
-
-fn write_http_head(
-    stream: &mut TcpStream,
-    content_length: usize,
-    content_type: &str,
-) -> Result<()> {
-    if let Err(err) = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
-        content_length, content_type
-    ) {
-        if is_benign_disconnect(&err) {
-            return Ok(());
-        }
-        return Err(err).context("failed to write proxy head response");
-    }
-    Ok(())
-}
-
-fn write_http_error(stream: &mut TcpStream, status: u16, message: &str) -> Result<()> {
-    let body = message.as_bytes();
-    let reason = match status {
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        502 => "Bad Gateway",
-        _ => "Internal Server Error",
-    };
-    if let Err(err) = write!(
-        stream,
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{}",
-        status,
-        reason,
-        body.len(),
-        message
-    ) {
-        if is_benign_disconnect(&err) {
-            return Ok(());
-        }
-        return Err(err).context("failed to write proxy error response");
-    }
-    Ok(())
-}
-
-fn is_benign_disconnect(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::UnexpectedEof
-    )
-}
-
-fn is_benign_proxy_error(err: &anyhow::Error) -> bool {
-    err.chain()
-        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(is_benign_disconnect)
-}
-
-fn mime_type_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("png") => "image/png",
-        Some("webp") => "image/webp",
-        Some("avif") => "image/avif",
-        Some("gif") => "image/gif",
-        _ => "application/octet-stream",
-    }
-}
-
-async fn download_page_reqwest(http: &Client, page: &Page, file: &Path) -> Result<()> {
-    let bytes = fetch_with_headers(http, &page.url, &page.headers).await?;
-    fs::write(file, &bytes)
-        .with_context(|| format!("failed to write cached page {}", file.display()))?;
-    Ok(())
-}
-
-async fn fetch_with_headers(
-    http: &Client,
-    url: &str,
-    headers: &std::collections::HashMap<String, String>,
-) -> Result<Vec<u8>> {
-    let build_req = |u: &str| {
-        let mut req = http.get(u).header("Accept", CACHE_ACCEPT);
-        for (key, value) in headers {
-            req = req.header(key, value);
-        }
-        req
-    };
-
-    let resp = build_req(url)
-        .send()
-        .await
-        .with_context(|| format!("request failed for {url}"))?;
-
-    // If we get a redirect response, follow it manually so our custom headers
-    // (Referer, Origin) are preserved on the new request.
-    let resp = if resp.status().is_redirection() {
-        let location = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("redirect with no Location header"))?;
-        build_req(&location)
-            .send()
-            .await
-            .with_context(|| format!("request failed after redirect to {location}"))?
-    } else {
-        resp
-    };
-
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("HTTP {status}");
-    }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .with_context(|| format!("failed to read bytes for {url}"))
-}
-
-fn download_page_curl(page: &Page, file: &Path) -> Result<()> {
-    let mut cmd = Command::new("curl");
-    cmd.arg("--fail")
-        .arg("--location")
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--insecure")
-        .arg("--location-trusted")
-        .arg("--user-agent")
-        .arg(CACHE_USER_AGENT)
-        .arg("--header")
-        .arg(format!("Accept: {CACHE_ACCEPT}"));
-    for (key, value) in &page.headers {
-        cmd.arg("--header").arg(format!("{key}: {value}"));
-    }
-    cmd.arg("--output").arg(file).arg(&page.url);
-    let status = cmd
-        .status()
-        .with_context(|| "failed to run curl for cache download")?;
-    if !status.success() {
-        bail!("curl exited with status {status}");
-    }
-    Ok(())
-}
-
-fn manga_cache_chapter_dir(
-    manga_id: &str,
-    translation: Translation,
-    chapter: &str,
-    cache_base_override: Option<&Path>,
-) -> Result<PathBuf> {
-    let base = if let Some(path) = cache_base_override {
-        path.to_path_buf()
-    } else {
-        cache_dir().ok_or_else(|| anyhow!("Could not determine cache directory"))?
-    };
-    Ok(base
-        .join("anv")
-        .join("manga-pages")
-        .join(sanitize_cache_segment(manga_id))
-        .join(translation.as_str())
-        .join(sanitize_cache_segment(chapter)))
-}
-
-fn sanitize_cache_segment(value: &str) -> String {
-    let cleaned: String = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        String::from("unknown")
-    } else {
-        cleaned
-    }
-}
-
-fn infer_page_extension(url: &str) -> String {
-    let path = url.split('?').next().unwrap_or(url);
-    match path.rsplit('.').next().map(|s| s.to_ascii_lowercase()) {
-        Some(ext)
-            if matches!(
-                ext.as_str(),
-                "jpg" | "jpeg" | "png" | "webp" | "avif" | "gif"
-            ) =>
-        {
-            if ext == "jpeg" {
-                String::from("jpg")
-            } else {
-                ext
-            }
-        }
-        _ => String::from("jpg"),
-    }
-}
-
-fn history_path() -> Result<PathBuf> {
-    let base = data_dir().ok_or_else(|| anyhow!("Could not determine data directory"))?;
-    Ok(base.join("anv").join("history.json"))
-}
-
-fn theme() -> ColorfulTheme {
-    ColorfulTheme::default()
 }
