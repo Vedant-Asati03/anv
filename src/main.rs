@@ -407,6 +407,7 @@ async fn run_anime_flow(
                     history,
                     history_path,
                     entry.translation,
+                    Provider::Allanime,
                     ShowInfo {
                         id: entry.show_id.clone(),
                         title: entry.show_title.clone(),
@@ -458,6 +459,7 @@ async fn run_anime_flow(
         history,
         history_path,
         translation,
+        Provider::Allanime,
         show,
         cli.episode.clone(),
     )
@@ -469,6 +471,7 @@ async fn play_show(
     history: &mut History,
     history_path: &Path,
     translation: Translation,
+    provider: Provider,
     show: ShowInfo,
     prefer_episode: Option<String>,
 ) -> Result<()> {
@@ -579,7 +582,7 @@ async fn play_show(
             show_title: show.title.clone(),
             episode: chosen.clone(),
             translation,
-            provider: Provider::Allanime,
+            provider,
             is_manga: false,
             watched_at: Utc::now(),
         });
