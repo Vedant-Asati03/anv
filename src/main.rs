@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use chrono::Utc;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use dialoguer::Select;
 use reqwest::StatusCode;
 
@@ -23,22 +23,17 @@ use providers::{
     AnimeProvider, MangaProvider, allanime::AllAnimeClient, mangadex::MangaDexClient,
     mangapill::MangapillClient,
 };
-use types::{ChapterCounts, EpisodeCounts, MangaInfo, ShowInfo, Translation};
+use types::{ChapterCounts, EpisodeCounts, MangaInfo, Provider, ShowInfo, Translation};
 
 const INITIAL_MANGA_PAGE_PRELOAD: usize = 5;
-
-#[derive(Debug, Clone, ValueEnum)]
-enum Provider {
-    Allanime,
-    Mangadex,
-    Mangapill,
-}
 
 #[derive(Debug, Parser)]
 #[command(name = "anv", about = "Stream anime from AllAnime via mpv.", version)]
 struct Cli {
     #[arg(long)]
     dub: bool,
+    #[arg(long)]
+    raw: bool,
     #[arg(long)]
     history: bool,
     #[arg(long)]
@@ -54,12 +49,11 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let result = run().await;
-    if let Err(err) = &result {
-        eprintln!("error: {err:?}");
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("error: {err:#}");
+        std::process::exit(1);
     }
-    result
 }
 
 async fn run() -> Result<()> {
@@ -68,7 +62,11 @@ async fn run() -> Result<()> {
     let mut history = History::load(&history_path)?;
 
     if cli.manga {
-        let translation = Translation::Sub;
+        let translation = if cli.raw {
+            Translation::Raw
+        } else {
+            Translation::Sub
+        };
         match cli.provider {
             Provider::Allanime => {
                 let client = AllAnimeClient::new()?;
@@ -148,6 +146,7 @@ async fn run_manga_flow(
         history_path,
         cli.episode.clone(),
         cli.cache_dir.as_deref(),
+        cli.provider,
     )
     .await
 }
@@ -160,6 +159,7 @@ async fn read_manga(
     history_path: &Path,
     prefer_chapter: Option<String>,
     cache_base_override: Option<&Path>,
+    provider: Provider,
 ) -> Result<()> {
     let chapters = match client.fetch_chapters(&manga.id, translation).await {
         Ok(c) => c,
@@ -326,6 +326,7 @@ async fn read_manga(
             show_title: manga.title.clone(),
             episode: chosen_label.clone(),
             translation,
+            provider,
             is_manga: true,
             watched_at: Utc::now(),
         });
@@ -354,20 +355,52 @@ async fn run_anime_flow(
     if history_mode {
         if let Some(entry) = history.select_entry()? {
             if entry.is_manga {
-                read_manga(
-                    &client,
-                    entry.translation,
-                    MangaInfo {
-                        id: entry.show_id.clone(),
-                        title: entry.show_title.clone(),
-                        available_chapters: ChapterCounts::default(),
-                    },
-                    history,
-                    history_path,
-                    Some(entry.episode.clone()),
-                    cli.cache_dir.as_deref(),
-                )
-                .await?;
+                let manga_info = MangaInfo {
+                    id: entry.show_id.clone(),
+                    title: entry.show_title.clone(),
+                    available_chapters: ChapterCounts::default(),
+                };
+                match entry.provider {
+                    Provider::Allanime => {
+                        read_manga(
+                            &AllAnimeClient::new()?,
+                            entry.translation,
+                            manga_info,
+                            history,
+                            history_path,
+                            Some(entry.episode.clone()),
+                            cli.cache_dir.as_deref(),
+                            entry.provider,
+                        )
+                        .await?
+                    }
+                    Provider::Mangadex => {
+                        read_manga(
+                            &MangaDexClient::new()?,
+                            entry.translation,
+                            manga_info,
+                            history,
+                            history_path,
+                            Some(entry.episode.clone()),
+                            cli.cache_dir.as_deref(),
+                            entry.provider,
+                        )
+                        .await?
+                    }
+                    Provider::Mangapill => {
+                        read_manga(
+                            &MangapillClient::new()?,
+                            entry.translation,
+                            manga_info,
+                            history,
+                            history_path,
+                            Some(entry.episode.clone()),
+                            cli.cache_dir.as_deref(),
+                            entry.provider,
+                        )
+                        .await?
+                    }
+                }
             } else {
                 play_show(
                     &client,
@@ -533,12 +566,8 @@ async fn play_show(
             continue;
         }
 
-        let stream = match choose_stream(streams) {
-            Ok(stream) => stream,
-            Err(_) => {
-                println!("Stream selection cancelled.");
-                continue;
-            }
+        let Some(stream) = choose_stream(streams)? else {
+            continue;
         };
 
         let next_candidate = next_episode_label_presorted(&chosen, &sorted_episodes);
@@ -550,6 +579,7 @@ async fn play_show(
             show_title: show.title.clone(),
             episode: chosen.clone(),
             translation,
+            provider: Provider::Allanime,
             is_manga: false,
             watched_at: Utc::now(),
         });
@@ -565,19 +595,17 @@ async fn play_show(
     }
 }
 
-fn compare_episode_labels(left: &str, right: &str) -> Ordering {
-    let l = parse_episode_key(left);
-    let r = parse_episode_key(right);
-    l.partial_cmp(&r).unwrap_or(Ordering::Equal)
-}
-
 fn parse_episode_key(label: &str) -> f64 {
     label.parse::<f64>().unwrap_or(0.0)
 }
 
 fn sorted_episode_labels(episodes: &[String]) -> Vec<String> {
     let mut sorted = episodes.to_vec();
-    sorted.sort_by(|a, b| compare_episode_labels(a, b));
+    sorted.sort_by(|a, b| {
+        parse_episode_key(a)
+            .partial_cmp(&parse_episode_key(b))
+            .unwrap_or(Ordering::Equal)
+    });
     sorted.dedup();
     sorted
 }
