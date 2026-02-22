@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use std::collections::HashMap;
 
-use super::{AnimeProvider, MangaProvider};
+use super::{AnimeProvider, MangaProvider, USER_AGENT};
 use crate::types::{
-    ChapterCounts, EpisodeCounts, MangaInfo, Page, ShowInfo, StreamOption, Translation,
+    Chapter, ChapterCounts, EpisodeCounts, MangaInfo, Page, ShowInfo, StreamOption, Translation,
 };
 
 const ALLANIME_API_URL: &str = "https://api.allanime.day/api";
@@ -14,7 +14,6 @@ const ALLANIME_REFERER: &str = "https://allmanga.to";
 const ALLANIME_IMAGE_REFERER: &str = "https://allanime.to";
 const ALLANIME_ORIGIN: &str = "https://allanime.day";
 const PREFERRED_PROVIDERS: &[&str] = &["Default", "S-mp4", "Luf-Mp4", "Yt-mp4"];
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36";
 
 pub struct AllAnimeClient {
     client: Client,
@@ -26,18 +25,15 @@ impl AllAnimeClient {
         Ok(Self { client })
     }
 
-    async fn fetch_show_detail(&self, show_id: &str) -> Result<ShowDetail> {
-        let body = serde_json::json!({
-            "query": SHOW_DETAIL_QUERY,
-            "variables": { "showId": show_id }
-        });
+    /// POST a GraphQL request to the AllAnime API and deserialize the `data` field.
+    async fn post_graphql<T: DeserializeOwned>(&self, body: &serde_json::Value) -> Result<T> {
         let response = self
             .client
             .post(ALLANIME_API_URL)
             .header("Referer", ALLANIME_REFERER)
             .header("Origin", ALLANIME_ORIGIN)
             .header("Accept", "application/json")
-            .json(&body)
+            .json(body)
             .send()
             .await?;
         let status = response.status();
@@ -45,9 +41,18 @@ impl AllAnimeClient {
         if !status.is_success() {
             bail!("AllAnime API HTTP {status}: {text}");
         }
-        let envelope: GraphQlEnvelope<ShowDetailPayload> =
-            serde_json::from_str(&text).with_context(|| "failed to parse show detail response")?;
-        Self::extract_data(envelope).map(|payload| payload.show)
+        let envelope: GraphQlEnvelope<T> =
+            serde_json::from_str(&text).context("failed to parse AllAnime API response")?;
+        Self::extract_data(envelope)
+    }
+
+    async fn fetch_show_detail(&self, show_id: &str) -> Result<ShowDetail> {
+        let body = serde_json::json!({
+            "query": SHOW_DETAIL_QUERY,
+            "variables": { "showId": show_id }
+        });
+        let payload: ShowDetailPayload = self.post_graphql(&body).await?;
+        Ok(payload.show)
     }
 
     async fn fetch_episode_sources_internal(
@@ -64,23 +69,8 @@ impl AllAnimeClient {
                 "episodeString": episode
             }
         });
-        let response = self
-            .client
-            .post(ALLANIME_API_URL)
-            .header("Referer", ALLANIME_REFERER)
-            .header("Origin", ALLANIME_ORIGIN)
-            .header("Accept", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            bail!("AllAnime API HTTP {status}: {text}");
-        }
-        let envelope: GraphQlEnvelope<EpisodePayload> =
-            serde_json::from_str(&text).with_context(|| "failed to parse episode response")?;
-        Self::extract_data(envelope).map(|payload| payload.episode.source_urls)
+        let payload: EpisodePayload = self.post_graphql(&body).await?;
+        Ok(payload.episode.source_urls)
     }
 
     async fn fetch_clock_json(&self, path: &str) -> Result<ClockResponse> {
@@ -108,23 +98,8 @@ impl AllAnimeClient {
             "query": MANGA_DETAIL_QUERY,
             "variables": { "mangaId": manga_id }
         });
-        let response = self
-            .client
-            .post(ALLANIME_API_URL)
-            .header("Referer", ALLANIME_REFERER)
-            .header("Origin", ALLANIME_ORIGIN)
-            .header("Accept", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            bail!("AllAnime API HTTP {status}: {text}");
-        }
-        let envelope: GraphQlEnvelope<MangaDetailPayload> =
-            serde_json::from_str(&text).with_context(|| "failed to parse manga detail response")?;
-        Self::extract_data(envelope).map(|payload| payload.manga)
+        let payload: MangaDetailPayload = self.post_graphql(&body).await?;
+        Ok(payload.manga)
     }
 
     fn extract_data<T>(envelope: GraphQlEnvelope<T>) -> Result<T> {
@@ -139,6 +114,12 @@ impl AllAnimeClient {
         envelope
             .data
             .ok_or_else(|| anyhow!("AllAnime API returned empty response"))
+    }
+}
+
+impl Default for AllAnimeClient {
+    fn default() -> Self {
+        Self::new().expect("failed to build HTTP client")
     }
 }
 
@@ -158,46 +139,30 @@ impl AnimeProvider for AllAnimeClient {
                 "countryOrigin": "ALL"
             }
         });
-        let response = self
-            .client
-            .post(ALLANIME_API_URL)
-            .header("Referer", ALLANIME_REFERER)
-            .header("Origin", ALLANIME_ORIGIN)
-            .header("Accept", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            bail!("AllAnime API HTTP {status}: {text}");
-        }
-        let envelope: GraphQlEnvelope<SearchPayload> =
-            serde_json::from_str(&text).with_context(|| "failed to parse search response")?;
-        Self::extract_data(envelope).map(|payload| {
-            payload
-                .shows
-                .edges
-                .into_iter()
-                .map(|edge| ShowInfo {
-                    id: edge.id,
-                    title: edge.name,
-                    available_eps: EpisodeCounts {
-                        sub: edge.available_episodes.sub,
-                        dub: edge.available_episodes.dub,
-                    },
-                })
-                .collect()
-        })
+        let payload: SearchPayload = self.post_graphql(&body).await?;
+        Ok(payload
+            .shows
+            .edges
+            .into_iter()
+            .map(|edge| ShowInfo {
+                id: edge.id,
+                title: edge.name,
+                available_eps: EpisodeCounts {
+                    sub: edge.available_episodes.sub,
+                    dub: edge.available_episodes.dub,
+                },
+            })
+            .collect())
     }
 
     async fn fetch_episodes(&self, show_id: &str, translation: Translation) -> Result<Vec<String>> {
         let detail = self.fetch_show_detail(show_id).await?;
-        Ok(match translation {
+        let episodes = match translation {
             Translation::Sub => detail.available_episodes_detail.sub,
             Translation::Dub => detail.available_episodes_detail.dub,
-            _ => vec![],
-        })
+            Translation::Raw => bail!("Raw translation is not supported for anime"),
+        };
+        Ok(episodes)
     }
 
     async fn fetch_streams(
@@ -228,7 +193,6 @@ impl AnimeProvider for AllAnimeClient {
                 }
 
                 if !options.is_empty() {
-                    // Sort by quality
                     options.sort_by(|a, b| b.quality_rank.cmp(&a.quality_rank));
                     return Ok(options);
                 }
@@ -255,107 +219,78 @@ impl MangaProvider for AllAnimeClient {
                 "countryOrigin": "ALL"
             }
         });
-        let response = self
-            .client
-            .post(ALLANIME_API_URL)
-            .header("Referer", ALLANIME_REFERER)
-            .header("Origin", ALLANIME_ORIGIN)
-            .header("Accept", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            bail!("AllAnime API HTTP {status}: {text}");
-        }
-        let envelope: GraphQlEnvelope<SearchMangaPayload> =
-            serde_json::from_str(&text).with_context(|| "failed to parse search response")?;
-        Self::extract_data(envelope).map(|payload| {
-            payload
-                .mangas
-                .edges
-                .into_iter()
-                .map(|edge| MangaInfo {
-                    id: edge.id,
-                    title: edge.name,
-                    available_chapters: ChapterCounts {
-                        sub: edge.available_chapters.sub,
-                        raw: edge.available_chapters.raw,
-                    },
-                })
-                .collect()
-        })
+        let payload: SearchMangaPayload = self.post_graphql(&body).await?;
+        Ok(payload
+            .mangas
+            .edges
+            .into_iter()
+            .map(|edge| MangaInfo {
+                id: edge.id,
+                title: edge.name,
+                available_chapters: ChapterCounts {
+                    sub: edge.available_chapters.sub,
+                    raw: edge.available_chapters.raw,
+                },
+            })
+            .collect())
     }
 
     async fn fetch_chapters(
         &self,
         manga_id: &str,
         translation: Translation,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<Chapter>> {
         let detail = self.fetch_manga_detail(manga_id).await?;
-        Ok(match translation {
+        let raw_chapters = match translation {
             Translation::Sub => detail.available_chapters_detail.sub,
             Translation::Raw => detail.available_chapters_detail.raw,
-            _ => vec![],
-        })
+            Translation::Dub => bail!("Dub translation is not supported for manga"),
+        };
+        Ok(raw_chapters
+            .into_iter()
+            .map(|ch| Chapter {
+                id: ch.clone(),
+                label: ch,
+            })
+            .collect())
     }
 
     async fn fetch_pages(
         &self,
         manga_id: &str,
         translation: Translation,
-        chapter: &str,
+        chapter_id: &str,
     ) -> Result<Vec<Page>> {
         let body = serde_json::json!({
             "query": CHAPTER_PAGES_QUERY,
             "variables": {
                 "mangaId": manga_id,
                 "translationType": translation.as_str(),
-                "chapterString": chapter
+                "chapterString": chapter_id
             }
         });
-        let response = self
-            .client
-            .post(ALLANIME_API_URL)
-            .header("Referer", ALLANIME_REFERER)
-            .header("Origin", ALLANIME_ORIGIN)
-            .header("Accept", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            bail!("AllAnime API HTTP {status}: {text}");
-        }
-        let envelope: GraphQlEnvelope<ChapterPagesPayload> = serde_json::from_str(&text)
-            .with_context(|| "failed to parse chapter pages response")?;
-        Self::extract_data(envelope).map(|payload| {
-            if let Some(edge) = payload.chapter_pages.edges.first() {
-                let head = &edge.picture_url_head;
-                edge.picture_urls
-                    .iter()
-                    .map(|p| {
-                        let url = if p.url.starts_with("http") {
-                            p.url.clone()
-                        } else {
-                            format!("{}{}", head, p.url)
-                        };
-                        let mut headers = HashMap::new();
-                        headers.insert("Referer".to_string(), ALLANIME_IMAGE_REFERER.to_string());
-                        headers.insert("Origin".to_string(), ALLANIME_IMAGE_REFERER.to_string());
-                        Page { url, headers }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            }
+        let payload: ChapterPagesPayload = self.post_graphql(&body).await?;
+        Ok(if let Some(edge) = payload.chapter_pages.edges.first() {
+            let head = &edge.picture_url_head;
+            edge.picture_urls
+                .iter()
+                .map(|p| {
+                    let url = if p.url.starts_with("http") {
+                        p.url.clone()
+                    } else {
+                        format!("{}{}", head, p.url)
+                    };
+                    let mut headers = HashMap::new();
+                    headers.insert("Referer".to_string(), ALLANIME_IMAGE_REFERER.to_string());
+                    headers.insert("Origin".to_string(), ALLANIME_IMAGE_REFERER.to_string());
+                    Page { url, headers }
+                })
+                .collect()
+        } else {
+            Vec::new()
         })
     }
 }
-
-// --- Helper Functions ---
 
 fn build_stream_option(provider: &str, link: ClockLink) -> StreamOption {
     let quality_label = link
@@ -412,97 +347,16 @@ fn decode_provider_path(raw: &str) -> Option<String> {
     Some(decoded)
 }
 
+/// Decodes a two-hex-digit string to its corresponding URL character.
+///
+/// The encoding is a simple XOR cipher: `byte ^ 0x38`, where `byte` is the
+/// hex-decoded value of the two-character pair.
 fn decode_pair(pair: &str) -> Option<char> {
-    match pair {
-        "79" => Some('A'),
-        "7a" => Some('B'),
-        "7b" => Some('C'),
-        "7c" => Some('D'),
-        "7d" => Some('E'),
-        "7e" => Some('F'),
-        "7f" => Some('G'),
-        "70" => Some('H'),
-        "71" => Some('I'),
-        "72" => Some('J'),
-        "73" => Some('K'),
-        "74" => Some('L'),
-        "75" => Some('M'),
-        "76" => Some('N'),
-        "77" => Some('O'),
-        "68" => Some('P'),
-        "69" => Some('Q'),
-        "6a" => Some('R'),
-        "6b" => Some('S'),
-        "6c" => Some('T'),
-        "6d" => Some('U'),
-        "6e" => Some('V'),
-        "6f" => Some('W'),
-        "60" => Some('X'),
-        "61" => Some('Y'),
-        "62" => Some('Z'),
-        "59" => Some('a'),
-        "5a" => Some('b'),
-        "5b" => Some('c'),
-        "5c" => Some('d'),
-        "5d" => Some('e'),
-        "5e" => Some('f'),
-        "5f" => Some('g'),
-        "50" => Some('h'),
-        "51" => Some('i'),
-        "52" => Some('j'),
-        "53" => Some('k'),
-        "54" => Some('l'),
-        "55" => Some('m'),
-        "56" => Some('n'),
-        "57" => Some('o'),
-        "48" => Some('p'),
-        "49" => Some('q'),
-        "4a" => Some('r'),
-        "4b" => Some('s'),
-        "4c" => Some('t'),
-        "4d" => Some('u'),
-        "4e" => Some('v'),
-        "4f" => Some('w'),
-        "40" => Some('x'),
-        "41" => Some('y'),
-        "42" => Some('z'),
-        "08" => Some('0'),
-        "09" => Some('1'),
-        "0a" => Some('2'),
-        "0b" => Some('3'),
-        "0c" => Some('4'),
-        "0d" => Some('5'),
-        "0e" => Some('6'),
-        "0f" => Some('7'),
-        "00" => Some('8'),
-        "01" => Some('9'),
-        "15" => Some('-'),
-        "16" => Some('.'),
-        "67" => Some('_'),
-        "46" => Some('~'),
-        "02" => Some(':'),
-        "17" => Some('/'),
-        "07" => Some('?'),
-        "1b" => Some('#'),
-        "63" => Some('['),
-        "65" => Some(']'),
-        "78" => Some('@'),
-        "19" => Some('!'),
-        "1c" => Some('$'),
-        "1e" => Some('&'),
-        "10" => Some('('),
-        "11" => Some(')'),
-        "12" => Some('*'),
-        "13" => Some('+'),
-        "14" => Some(','),
-        "03" => Some(';'),
-        "05" => Some('='),
-        "1d" => Some('%'),
-        _ => None,
-    }
+    let byte = u8::from_str_radix(pair, 16).ok()?;
+    let ch = (byte ^ 0x38) as char;
+    // Only emit printable (graphic) ASCII — control characters have no place in URLs.
+    ch.is_ascii_graphic().then_some(ch)
 }
-
-// --- GraphQL Structs ---
 
 #[derive(Debug, Deserialize)]
 struct GraphQlEnvelope<T> {
@@ -681,8 +535,6 @@ struct ClockSubtitle {
     #[serde(default)]
     label: Option<String>,
 }
-
-// --- Queries ---
 
 const SEARCH_SHOWS_QUERY: &str = r#"query($search: SearchInput, $limit: Int, $page: Int, $translationType: VaildTranslationTypeEnumType, $countryOrigin: VaildCountryOriginEnumType) {
   shows(search: $search, limit: $limit, page: $page, translationType: $translationType, countryOrigin: $countryOrigin) {
