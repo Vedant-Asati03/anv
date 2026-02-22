@@ -333,7 +333,7 @@ async fn run_manga_flow(
         manga,
         history,
         history_path,
-        None,
+        cli.episode.clone(),
         cli.cache_dir.as_deref(),
     )
     .await
@@ -374,9 +374,18 @@ async fn read_manga(
         println!("Last read {} chapter: {}.", translation.label(), prev);
     }
 
-    let mut current_chapter = prefer_chapter
-        .or_else(|| last_read.clone())
-        .unwrap_or_else(|| latest_available.clone());
+    let fallback = last_read.unwrap_or_else(|| latest_available.clone());
+    let (mut current_chapter, mut skip_selection) = match &prefer_chapter {
+        Some(ch) if chapters.contains(ch) => (ch.clone(), true),
+        Some(ch) => {
+            println!(
+                "Chapter '{}' does not exist for '{}'. Showing chapter list.",
+                ch, manga.title
+            );
+            (fallback, false)
+        }
+        None => (fallback, false),
+    };
 
     loop {
         let default_idx = chapters
@@ -385,14 +394,20 @@ async fn read_manga(
             .or_else(|| chapters.iter().position(|ch| ch == &latest_available))
             .unwrap_or(0);
 
-        let selection = Select::with_theme(&theme())
-            .with_prompt("Chapter to read (Enter to select, Esc to cancel)")
-            .items(&chapters)
-            .default(default_idx)
-            .interact_opt()?;
-        let Some(idx) = selection else {
-            println!("Exiting reading loop.");
-            return Ok(());
+        let idx = if skip_selection {
+            skip_selection = false;
+            default_idx
+        } else {
+            let selection = Select::with_theme(&theme())
+                .with_prompt("Chapter to read (Enter to select, Esc to cancel)")
+                .items(&chapters)
+                .default(default_idx)
+                .interact_opt()?;
+            let Some(i) = selection else {
+                println!("Exiting reading loop.");
+                return Ok(());
+            };
+            i
         };
 
         let chosen = chapters[idx].clone();
@@ -455,11 +470,10 @@ async fn read_manga(
             &chosen,
         )?;
 
-        let chosen_copy = chosen.clone();
         history.upsert(HistoryEntry {
             show_id: manga.id.clone(),
             show_title: manga.title.clone(),
-            episode: chosen_copy.clone(),
+            episode: chosen.clone(),
             translation,
             is_manga: true,
             watched_at: Utc::now(),
@@ -467,16 +481,12 @@ async fn read_manga(
         history.save(history_path)?;
 
         match (auto_advance, next_candidate) {
-            (true, Some(next)) => {
-                current_chapter = next;
-            }
+            (true, Some(next)) => current_chapter = next,
             (true, None) => {
                 println!("No further chapters found. Exiting.");
                 return Ok(());
             }
-            (false, candidate) => {
-                current_chapter = candidate.unwrap_or_else(|| chosen.clone());
-            }
+            (false, candidate) => current_chapter = candidate.unwrap_or(chosen),
         }
     }
 }
@@ -566,38 +576,32 @@ async fn run_anime_flow(
     if history_mode {
         if let Some(entry) = history.select_entry()? {
             if entry.is_manga {
-                let manga = MangaInfo {
-                    id: entry.show_id.clone(),
-                    title: entry.show_title.clone(),
-                    available_chapters: ChapterCounts::default(),
-                };
-                let preferred_chapter = Some(entry.episode.clone());
-                let entry_translation = entry.translation;
                 read_manga(
                     &client,
-                    entry_translation,
-                    manga,
+                    entry.translation,
+                    MangaInfo {
+                        id: entry.show_id.clone(),
+                        title: entry.show_title.clone(),
+                        available_chapters: ChapterCounts::default(),
+                    },
                     history,
                     history_path,
-                    preferred_chapter,
+                    Some(entry.episode.clone()),
                     cli.cache_dir.as_deref(),
                 )
                 .await?;
             } else {
-                let show = ShowInfo {
-                    id: entry.show_id.clone(),
-                    title: entry.show_title.clone(),
-                    available_eps: EpisodeCounts::default(),
-                };
-                let preferred_episode = Some(entry.episode.clone());
-                let entry_translation = entry.translation;
                 play_show(
                     &client,
                     history,
                     history_path,
-                    entry_translation,
-                    show,
-                    preferred_episode,
+                    entry.translation,
+                    ShowInfo {
+                        id: entry.show_id.clone(),
+                        title: entry.show_title.clone(),
+                        available_eps: EpisodeCounts::default(),
+                    },
+                    Some(entry.episode.clone()),
                 )
                 .await?;
             }
@@ -683,35 +687,17 @@ async fn play_show(
         println!("Last watched {} episode: {}.", translation.label(), prev);
     }
 
-    // Determine starting episode and whether to skip the selection dialog on
-    // the first iteration (when the caller provides a valid --episode flag).
+    let fallback = last_watched.unwrap_or_else(|| latest_available.clone());
     let (mut current_episode, mut skip_selection) = match &prefer_episode {
-        Some(ep) if episodes.contains(ep) => {
-            // Valid episode flag — jump directly, skip selection on first pass.
-            (ep.clone(), true)
-        }
+        Some(ep) if episodes.contains(ep) => (ep.clone(), true),
         Some(ep) => {
-            // Episode flag provided but doesn't exist — warn, then show list.
             println!(
                 "Episode '{}' does not exist for '{}'. Showing episode list.",
                 ep, show.title
             );
-            (
-                last_watched
-                    .clone()
-                    .unwrap_or_else(|| latest_available.clone()),
-                false,
-            )
+            (fallback, false)
         }
-        None => {
-            // No episode flag — use history / latest as the default selection.
-            (
-                last_watched
-                    .clone()
-                    .unwrap_or_else(|| latest_available.clone()),
-                false,
-            )
-        }
+        None => (fallback, false),
     };
 
     loop {
@@ -721,9 +707,8 @@ async fn play_show(
             .or_else(|| episodes.iter().position(|ep| ep == &latest_available))
             .unwrap_or(0);
 
-        // On the first iteration of a direct-jump, bypass the selection dialog.
         let idx = if skip_selection {
-            skip_selection = false; // only skip once
+            skip_selection = false;
             default_idx
         } else {
             let selection = Select::with_theme(&theme())
@@ -780,27 +765,22 @@ async fn play_show(
 
         launch_player(&stream, &show.title, &chosen)?;
 
-        let chosen_copy = chosen.clone();
         history.upsert(HistoryEntry {
             show_id: show.id.clone(),
             show_title: show.title.clone(),
-            episode: chosen_copy.clone(),
+            episode: chosen.clone(),
             translation,
             is_manga: false,
             watched_at: Utc::now(),
         });
         history.save(history_path)?;
         match (auto_advance, next_candidate) {
-            (true, Some(next)) => {
-                current_episode = next;
-            }
+            (true, Some(next)) => current_episode = next,
             (true, None) => {
                 println!("No further episodes found. Exiting.");
                 return Ok(());
             }
-            (false, candidate) => {
-                current_episode = candidate.unwrap_or_else(|| chosen_copy.clone());
-            }
+            (false, candidate) => current_episode = candidate.unwrap_or(chosen),
         }
     }
 }
