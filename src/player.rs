@@ -110,7 +110,7 @@ pub async fn launch_image_viewer(
                 println!("Launching viewer for Chapter {chapter}...");
                 let status = cmd.status().await.context("failed to launch viewer")?;
                 proxy.shutdown();
-                if !status.success() {
+                if !status.success() && status.code() != Some(2) {
                     bail!("viewer exited with status {status}");
                 }
                 return Ok(());
