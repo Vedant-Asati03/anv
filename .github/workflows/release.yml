@@ -59,7 +59,7 @@ jobs:
         id: crate_meta
         shell: bash
         run: |
-          VERSION=$(sed -n 's/^version\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n1)
+          VERSION=$(grep '^version' Cargo.toml | head -n1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
@@ -151,5 +151,7 @@ jobs:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           files: release-assets/*
           generate_release_notes: true
+          make_latest: true
+          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
