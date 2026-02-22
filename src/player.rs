@@ -16,9 +16,9 @@ pub fn detect_player() -> String {
         .unwrap_or_else(|| "mpv".to_string())
 }
 
-pub fn choose_stream(mut options: Vec<StreamOption>) -> Result<StreamOption> {
+pub fn choose_stream(mut options: Vec<StreamOption>) -> Result<Option<StreamOption>> {
     if options.len() == 1 {
-        return Ok(options.remove(0));
+        return Ok(Some(options.remove(0)));
     }
     let labels: Vec<String> = options.iter().map(StreamOption::label).collect();
     let selection = Select::with_theme(&theme())
@@ -27,9 +27,9 @@ pub fn choose_stream(mut options: Vec<StreamOption>) -> Result<StreamOption> {
         .default(0)
         .interact_opt()?;
     let Some(idx) = selection else {
-        bail!("Stream selection cancelled.");
+        return Ok(None);
     };
-    Ok(options.remove(idx))
+    Ok(Some(options.remove(idx)))
 }
 
 pub async fn launch_player(stream: &StreamOption, title: &str, episode: &str) -> Result<()> {
