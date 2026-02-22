@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Result, bail};
 use chrono::Utc;
 use clap::Parser;
-use dialoguer::Select;
+use dialoguer::{FuzzySelect, Select};
 use reqwest::StatusCode;
 
 mod cache;
@@ -228,8 +228,8 @@ async fn read_manga(
             skip_selection = false;
             default_idx
         } else {
-            let selection = Select::with_theme(&theme)
-                .with_prompt("Chapter to read (Enter to select, Esc to cancel)")
+            let selection = FuzzySelect::with_theme(&theme)
+                .with_prompt("Chapter to read (type to search, Esc to cancel)")
                 .items(&chapter_labels)
                 .default(default_idx)
                 .interact_opt()?;
@@ -524,8 +524,8 @@ async fn play_show(
             skip_selection = false;
             default_idx
         } else {
-            let selection = Select::with_theme(&theme)
-                .with_prompt("Episode to play (Enter to select, Esc to cancel)")
+            let selection = FuzzySelect::with_theme(&theme)
+                .with_prompt("Episode to play (type to search, Esc to cancel)")
                 .items(&episodes)
                 .default(default_idx)
                 .interact_opt()?;
