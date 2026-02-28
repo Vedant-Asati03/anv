@@ -16,6 +16,18 @@ pub fn detect_player() -> String {
         .unwrap_or_else(|| "mpv".to_string())
 }
 
+fn build_command(player: &str) -> Result<Command> {
+    let parts = shlex::split(player)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("Invalid player command: '{}'", player))?;
+    let (bin, args) = parts
+        .split_first()
+        .ok_or_else(|| anyhow!("Player command is empty"))?;
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    Ok(cmd)
+}
+
 pub fn choose_stream(mut options: Vec<StreamOption>) -> Result<Option<StreamOption>> {
     if options.len() == 1 {
         return Ok(Some(options.remove(0)));
@@ -32,9 +44,13 @@ pub fn choose_stream(mut options: Vec<StreamOption>) -> Result<Option<StreamOpti
     Ok(Some(options.remove(idx)))
 }
 
-pub async fn launch_player(stream: &StreamOption, title: &str, episode: &str) -> Result<()> {
-    let player = detect_player();
-    let mut cmd = Command::new(&player);
+pub async fn launch_player(
+    stream: &StreamOption,
+    title: &str,
+    episode: &str,
+    player: &str,
+) -> Result<()> {
+    let mut cmd = build_command(player)?;
     let media_title = format!("{title} - Episode {episode}");
     cmd.arg("--quiet");
     cmd.arg("--terminal=no");
@@ -58,9 +74,12 @@ pub async fn launch_player(stream: &StreamOption, title: &str, episode: &str) ->
         Ok(status) => status,
         Err(err) => {
             if err.kind() == std::io::ErrorKind::NotFound {
+                let bin = shlex::split(player)
+                    .and_then(|v| v.into_iter().next())
+                    .unwrap_or_else(|| player.to_string());
                 return Err(anyhow!(
-                    "Player '{}' not found. Install mpv or set {} to a valid command.",
-                    player,
+                    "Player binary '{}' not found. Install it or set {} to a valid command.",
+                    bin,
                     PLAYER_ENV_KEY
                 ));
             }
@@ -82,7 +101,7 @@ pub async fn launch_image_viewer(
     chapter: &str,
 ) -> Result<()> {
     let player = detect_player();
-    let mut cmd = Command::new(&player);
+    let mut cmd = build_command(&player)?;
     let media_title = format!("{title} - Chapter {chapter}");
     cmd.arg("--quiet");
     cmd.arg("--terminal=no");

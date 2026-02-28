@@ -3,17 +3,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use clap::Parser;
-use dialoguer::{FuzzySelect, Select};
+use clap::{Parser, Subcommand};
+use config::AppConfig;
+use dialoguer::{Confirm, FuzzySelect, Select, theme::ColorfulTheme};
 use reqwest::StatusCode;
 
 mod cache;
+mod config;
 mod history;
 mod player;
 mod providers;
 mod proxy;
+mod sync;
 mod types;
 
 use cache::{MangaCacheState, cache_manga_pages};
@@ -23,12 +26,17 @@ use providers::{
     AnimeProvider, MangaProvider, allanime::AllAnimeClient, mangadex::MangaDexClient,
     mangapill::MangapillClient,
 };
+use sync::{
+    SyncUpdate, WatchStatus,
+    mal::{AnimeInfo, MalClient, MalIdCache, MalToken, build_mal_client_if_enabled},
+    should_confirm_sync,
+};
 use types::{ChapterCounts, EpisodeCounts, MangaInfo, Provider, ShowInfo, Translation};
 
 const INITIAL_MANGA_PAGE_PRELOAD: usize = 5;
 
 #[derive(Debug, Parser)]
-#[command(name = "anv", about = "Stream anime from AllAnime via mpv.", version)]
+#[command(name = "anv", about = "Stream anime or read manga via mpv.", version)]
 struct Cli {
     #[arg(long)]
     dub: bool,
@@ -46,20 +54,78 @@ struct Cli {
     episode: Option<String>,
     #[arg(value_name = "QUERY")]
     query: Vec<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Manage sync with external anime list services.
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncAction {
+    /// Enable sync with a list provider and authenticate.
+    Enable {
+        #[command(subcommand)]
+        provider: SyncProviderCmd,
+    },
+    /// Show current sync status and MAL authentication state.
+    Status,
+    /// Disable MAL sync (can be re-enabled by editing config).
+    Disable,
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncProviderCmd {
+    /// Authenticate with MyAnimeList (runs OAuth flow if no token stored).
+    Mal,
 }
 
 #[tokio::main]
-async fn main() {
-    if let Err(err) = run().await {
+async fn main() -> Result<()> {
+    run().await.map_err(|err| {
         eprintln!("error: {err:#}");
         std::process::exit(1);
-    }
+    })
 }
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    let cfg = AppConfig::load().unwrap_or_else(|err| {
+        eprintln!("Warning: failed to load config ({err}), using defaults.");
+        AppConfig::default()
+    });
+
+    // Handle sync subcommands
+    match &cli.command {
+        Some(Commands::Sync {
+            action:
+                SyncAction::Enable {
+                    provider: SyncProviderCmd::Mal,
+                },
+        }) => return run_sync_enable_mal(&cfg).await,
+        Some(Commands::Sync {
+            action: SyncAction::Status,
+        }) => return run_sync_status(&cfg),
+        Some(Commands::Sync {
+            action: SyncAction::Disable,
+        }) => return run_sync_disable(cfg).await,
+        _ => {}
+    }
+
+    let history_mode =
+        cli.history || (cli.query.len() == 1 && cli.query[0].eq_ignore_ascii_case("history"));
     let history_path = history_path()?;
     let mut history = History::load(&history_path)?;
+
+    // Build MAL client if sync is enabled and a token exists
+    let mal_client = build_mal_client_if_enabled(&cfg);
 
     if cli.manga {
         let translation = if cli.raw {
@@ -95,7 +161,129 @@ async fn run() -> Result<()> {
     if !matches!(cli.provider, Provider::Allanime) {
         eprintln!("Warning: Only 'allanime' provider supports anime. Switching to 'allanime'.");
     }
-    run_anime_flow(&cli, translation, cli.history, &mut history, &history_path).await
+    run_anime_flow(
+        &cli,
+        translation,
+        history_mode,
+        &mut history,
+        &history_path,
+        cfg.player.clone(),
+        mal_client.as_ref(),
+    )
+    .await
+}
+
+/// `anv sync enable mal` — authenticates with MAL if needed.
+async fn run_sync_enable_mal(cfg: &AppConfig) -> Result<()> {
+    if cfg.mal.client_id.is_empty() {
+        bail!(
+            "MAL client_id is not set.\n\
+             1. Go to https://myanimelist.net/apiconfig and create an application.\n\
+             2. Set the app type to 'other' and redirect URI to: http://localhost:11422/callback\n\
+             3. Copy the Client ID and add it to your config:\n\
+             \n\
+             [mal]\n\
+             client_id = \"<your-client-id>\"\n\
+             \n\
+             Config location: {}",
+            AppConfig::config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".into())
+        );
+    }
+
+    // Check for an existing valid token
+    match MalToken::load()? {
+        Some(token) if !token.is_expired() => {
+            println!("Already authenticated with MyAnimeList.");
+            println!(
+                "To activate sync, set `sync.enabled = true` in your config:\n  {}",
+                AppConfig::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unknown>".into())
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // No valid token — run OAuth PKCE flow
+    // OAuth involves blocking I/O; run it in a blocking thread so we don't
+    // block the async executor.
+    let client_id = cfg.mal.client_id.clone();
+    let token = tokio::task::spawn_blocking(move || MalClient::authenticate(&client_id))
+        .await
+        .context("OAuth task panicked")?
+        .context("MAL OAuth flow failed")?;
+
+    println!("\n✓ Successfully authenticated with MyAnimeList!");
+    println!(
+        "Token stored at: {}",
+        MalToken::token_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".into())
+    );
+    println!(
+        "\nTo activate sync, set `sync.enabled = true` in:\n  {}",
+        AppConfig::config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".into())
+    );
+    let _ = token; // already saved inside authenticate()
+    Ok(())
+}
+
+/// `anv sync status` — show current sync/auth state.
+fn run_sync_status(cfg: &AppConfig) -> Result<()> {
+    let config_path = AppConfig::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
+
+    println!("── MAL Sync Status ──");
+    println!(
+        "  sync.enabled : {}",
+        if cfg.sync.enabled { "yes" } else { "no" }
+    );
+
+    if cfg.mal.client_id.is_empty() {
+        println!("  client_id    : not set  (add to {})", config_path);
+    } else {
+        let masked = format!("{}…", &cfg.mal.client_id[..cfg.mal.client_id.len().min(8)]);
+        println!("  client_id    : {}", masked);
+    }
+
+    match MalToken::load() {
+        Ok(Some(token)) => {
+            if token.is_expired() {
+                println!("  token        : expired  (run `anv sync enable mal` to refresh)");
+            } else {
+                println!(
+                    "  token        : valid, expires {}",
+                    token.expires_at.format("%Y-%m-%d %H:%M UTC")
+                );
+            }
+        }
+        Ok(None) => println!("  token        : not found  (run `anv sync enable mal`)"),
+        Err(err) => println!("  token        : error reading ({err})"),
+    }
+    Ok(())
+}
+
+/// `anv sync disable` — set sync.enabled = false and write config.
+async fn run_sync_disable(mut cfg: AppConfig) -> Result<()> {
+    if !cfg.sync.enabled {
+        println!("Sync is already disabled.");
+        return Ok(());
+    }
+    cfg.sync.enabled = false;
+    cfg.save().context("failed to save config")?;
+    println!(
+        "Sync disabled. Edit {} to re-enable.",
+        AppConfig::config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".into())
+    );
+    Ok(())
 }
 
 async fn run_manga_flow(
@@ -349,6 +537,8 @@ async fn run_anime_flow(
     history_mode: bool,
     history: &mut History,
     history_path: &Path,
+    player: String,
+    mal_client: Option<&MalClient>,
 ) -> Result<()> {
     let client = AllAnimeClient::new()?;
 
@@ -414,6 +604,8 @@ async fn run_anime_flow(
                         available_eps: EpisodeCounts::default(),
                     },
                     Some(entry.episode.clone()),
+                    &player,
+                    mal_client,
                 )
                 .await?;
             }
@@ -462,6 +654,8 @@ async fn run_anime_flow(
         Provider::Allanime,
         show,
         cli.episode.clone(),
+        &player,
+        mal_client,
     )
     .await
 }
@@ -474,6 +668,8 @@ async fn play_show(
     provider: Provider,
     show: ShowInfo,
     prefer_episode: Option<String>,
+    player: &str,
+    mal_client: Option<&MalClient>,
 ) -> Result<()> {
     let episodes = client.fetch_episodes(&show.id, translation).await?;
     if episodes.is_empty() {
@@ -513,6 +709,17 @@ async fn play_show(
             (fallback, false)
         }
         None => (fallback, false),
+    };
+
+    // Load the persistent AllAnime→MAL ID cache once per play_show invocation.
+    // For non-sync sessions (mal_client is None), this is a no-op load.
+    let mut mal_id_cache = if mal_client.is_some() {
+        MalIdCache::load().unwrap_or_else(|err| {
+            eprintln!("[sync] Warning: could not load ID cache ({err}), starting fresh.");
+            MalIdCache::default()
+        })
+    } else {
+        MalIdCache::default()
     };
 
     let theme = theme();
@@ -575,7 +782,7 @@ async fn play_show(
 
         let next_candidate = next_episode_label_presorted(&chosen, &sorted_episodes);
 
-        launch_player(&stream, &show.title, &chosen).await?;
+        launch_player(&stream, &show.title, &chosen, player).await?;
 
         history.upsert(HistoryEntry {
             show_id: show.id.clone(),
@@ -587,6 +794,150 @@ async fn play_show(
             watched_at: Utc::now(),
         });
         history.save(history_path)?;
+
+        // MAL sync: look up cached MAL ID or resolve+confirm once, then update
+        if let Some(mal) = mal_client {
+            let ep_num = chosen.parse::<u32>().unwrap_or(0);
+
+            // Resolve MAL ID: check persistent cache first, confirm only on miss
+            let mal_id_opt = if let Some(cached_id) = mal_id_cache.get(&show.id) {
+                Some(cached_id)
+            } else {
+                match mal.resolve_and_confirm_mal_id(&show.title).await {
+                    Ok(Some(id)) => {
+                        if let Err(err) = mal_id_cache.insert_and_save(&show.id, id) {
+                            eprintln!("[sync] Warning: could not save ID cache: {err}");
+                        }
+                        Some(id)
+                    }
+                    Ok(None) => None, // user declined
+                    Err(err) => {
+                        eprintln!("[sync] MAL ID resolution failed: {err}");
+                        None
+                    }
+                }
+            };
+
+            if let Some(mal_id) = mal_id_opt {
+                let anime_info = mal.get_anime_info(mal_id).await.unwrap_or_else(|err| {
+                    eprintln!(
+                        "[sync] Warning: could not fetch anime info ({err}), assuming Watching."
+                    );
+                    AnimeInfo {
+                        list_status: None,
+                        num_episodes: 0,
+                    }
+                });
+                let current = anime_info.list_status;
+
+                // Use MAL's planned total as the source of truth.
+                // If num_episodes == 0, MAL doesn't know the total yet (still
+                // airing / TBA) — never auto-mark as Completed in that case.
+                let new_status = if anime_info.num_episodes > 0 && ep_num >= anime_info.num_episodes
+                {
+                    WatchStatus::Completed
+                } else {
+                    WatchStatus::Watching
+                };
+
+                let needs_confirm = should_confirm_sync(&current, new_status);
+
+                let should_update = if needs_confirm {
+                    // Status is changing or not on list — ask the user
+                    Confirm::with_theme(&ColorfulTheme::default())
+                        .with_prompt(format!(
+                            "[sync] Update MAL: \"{}\" ep {} → {}?",
+                            show.title,
+                            ep_num,
+                            new_status.label()
+                        ))
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false)
+                } else {
+                    // Only episode count advanced, same status — silent
+                    true
+                };
+
+                if should_update {
+                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    // Set start_date when first *actually starting* to watch:
+                    // - not on list at all, OR
+                    // - was plan_to_watch (never actually started)
+                    let is_first_start = new_status == WatchStatus::Watching
+                        && match &current {
+                            None => true,
+                            Some(cur) => cur.status == "plan_to_watch",
+                        };
+                    let start_date = if is_first_start {
+                        Some(today.clone())
+                    } else {
+                        None
+                    };
+                    // Set finish_date whenever marking as completed
+                    let finish_date = if new_status == WatchStatus::Completed {
+                        Some(today)
+                    } else {
+                        None
+                    };
+
+                    // If the anime is now complete, ask the user to rate it before
+                    let score: Option<u8> = if new_status == WatchStatus::Completed {
+                        let mut rating_options: Vec<String> =
+                            (1u8..=10).map(|n| format!("{}/10", n)).collect();
+                        rating_options.push("Skip (no rating)".to_string());
+
+                        let rating_idx = Select::with_theme(&ColorfulTheme::default())
+                            .with_prompt(format!("Rate \"{}\" on MAL (Esc to skip)", show.title))
+                            .items(&rating_options)
+                            .default(rating_options.len() - 1) // default to Skip
+                            .interact_opt()?;
+
+                        match rating_idx {
+                            Some(idx) if idx < 10 => Some(idx as u8 + 1),
+                            _ => None, // Skip selected or Esc pressed
+                        }
+                    } else {
+                        None
+                    };
+
+                    let update = SyncUpdate {
+                        title: show.title.clone(),
+                        episode: ep_num,
+                        total_episodes: if anime_info.num_episodes > 0 {
+                            Some(anime_info.num_episodes)
+                        } else {
+                            None
+                        },
+                        status: new_status,
+                        start_date,
+                        finish_date,
+                        score,
+                    };
+                    match mal.update_status_with_id(mal_id, &update).await {
+                        Ok(()) => {
+                            if needs_confirm {
+                                println!(
+                                    "[sync] MAL updated: ep {} → {}",
+                                    ep_num,
+                                    new_status.label()
+                                );
+                            } else {
+                                println!("[sync] MAL progress saved: ep {}", ep_num);
+                            }
+                            if let Some(score_val) = score {
+                                println!("[sync] MAL score submitted: {}/10", score_val);
+                            } else if new_status == WatchStatus::Completed {
+                                println!("[sync] Rating skipped.");
+                            }
+                        }
+                        Err(err) => eprintln!("[sync] Failed to update MAL: {err}"),
+                    }
+                } else {
+                    println!("[sync] Skipped MAL update.");
+                }
+            }
+        };
         match (auto_advance, next_candidate) {
             (true, Some(next)) => current_episode = next,
             (true, None) => {
