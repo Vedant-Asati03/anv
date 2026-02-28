@@ -435,29 +435,37 @@ impl MalClient {
         self.update_list_status(mal_id, update).await
     }
 
-    /// Fetch the current list status for an anime.
-    /// Returns `None` if the anime is not on the user's list.
-    pub async fn get_anime_list_status(&self, mal_id: u32) -> Result<Option<CurrentListStatus>> {
+    /// Fetch the anime's list status and planned episode count in one request.
+    ///
+    /// `anime_info.num_episodes == 0` means MAL doesn't know the total yet
+    /// (still airing or not yet announced), so callers must not use it to
+    /// infer completion.
+    pub async fn get_anime_info(&self, mal_id: u32) -> Result<AnimeInfo> {
         #[derive(Deserialize)]
         struct AnimeWithStatus {
             my_list_status: Option<CurrentListStatus>,
+            #[serde(default)]
+            num_episodes: u32,
         }
 
         let resp = self
             .http
             .get(format!("{MAL_API_BASE}/anime/{mal_id}"))
             .bearer_auth(&self.token.access_token)
-            .query(&[("fields", "my_list_status")])
+            .query(&[("fields", "my_list_status,num_episodes")])
             .send()
             .await
-            .context("MAL get anime list status request failed")?
+            .context("MAL get anime info request failed")?
             .error_for_status()
-            .context("MAL returned error fetching list status")?
+            .context("MAL returned error fetching anime info")?
             .json::<AnimeWithStatus>()
             .await
-            .context("failed to parse MAL list status response")?;
+            .context("failed to parse MAL anime info response")?;
 
-        Ok(resp.my_list_status)
+        Ok(AnimeInfo {
+            list_status: resp.my_list_status,
+            num_episodes: resp.num_episodes,
+        })
     }
 }
 
@@ -465,6 +473,14 @@ impl MalClient {
 pub struct CurrentListStatus {
     pub status: String,
     pub num_episodes_watched: u32,
+}
+
+/// Combined per-anime info returned by [`MalClient::get_anime_info`].
+pub struct AnimeInfo {
+    /// The user's current list entry, or `None` if not on their list.
+    pub list_status: Option<CurrentListStatus>,
+    /// MAL's planned total episode count. `0` means unknown / still airing.
+    pub num_episodes: u32,
 }
 
 /// Build a MalClient only when sync is enabled and a stored token exists.

@@ -28,7 +28,7 @@ use providers::{
 };
 use sync::{
     SyncUpdate, WatchStatus,
-    mal::{MalClient, MalIdCache, MalToken, build_mal_client_if_enabled},
+    mal::{AnimeInfo, MalClient, MalIdCache, MalToken, build_mal_client_if_enabled},
     should_confirm_sync,
 };
 use types::{ChapterCounts, EpisodeCounts, MangaInfo, Provider, ShowInfo, Translation};
@@ -798,14 +798,6 @@ async fn play_show(
         // MAL sync: look up cached MAL ID or resolve+confirm once, then update
         if let Some(mal) = mal_client {
             let ep_num = chosen.parse::<u32>().unwrap_or(0);
-            // Use the fetched episodes list as the source of truth — the search-result
-            // snapshot (show.available_eps) can be 0 when the API omits it.
-            let total_eps = episodes.len() as u32;
-            let new_status = if total_eps > 0 && ep_num >= total_eps {
-                WatchStatus::Completed
-            } else {
-                WatchStatus::Watching
-            };
 
             // Resolve MAL ID: check persistent cache first, confirm only on miss
             let mal_id_opt = if let Some(cached_id) = mal_id_cache.get(&show.id) {
@@ -827,8 +819,27 @@ async fn play_show(
             };
 
             if let Some(mal_id) = mal_id_opt {
-                // Check current list status to decide whether to prompt
-                let current = mal.get_anime_list_status(mal_id).await.unwrap_or(None);
+                let anime_info = mal.get_anime_info(mal_id).await.unwrap_or_else(|err| {
+                    eprintln!(
+                        "[sync] Warning: could not fetch anime info ({err}), assuming Watching."
+                    );
+                    AnimeInfo {
+                        list_status: None,
+                        num_episodes: 0,
+                    }
+                });
+                let current = anime_info.list_status;
+
+                // Use MAL's planned total as the source of truth.
+                // If num_episodes == 0, MAL doesn't know the total yet (still
+                // airing / TBA) — never auto-mark as Completed in that case.
+                let new_status = if anime_info.num_episodes > 0 && ep_num >= anime_info.num_episodes
+                {
+                    WatchStatus::Completed
+                } else {
+                    WatchStatus::Watching
+                };
+
                 let needs_confirm = should_confirm_sync(&current, new_status);
 
                 let should_update = if needs_confirm {
@@ -893,7 +904,11 @@ async fn play_show(
                     let update = SyncUpdate {
                         title: show.title.clone(),
                         episode: ep_num,
-                        total_episodes: if total_eps > 0 { Some(total_eps) } else { None },
+                        total_episodes: if anime_info.num_episodes > 0 {
+                            Some(anime_info.num_episodes)
+                        } else {
+                            None
+                        },
                         status: new_status,
                         start_date,
                         finish_date,
