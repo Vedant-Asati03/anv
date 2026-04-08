@@ -6,7 +6,7 @@ anv is a terminal-native anime launcher for people who think tmux panes and watc
 - Curated for AllAnime streams – fast GraphQL search with zero spoiler thumbnails.
 - Sub or dub on demand via `--dub`; switches the query and history tagging automatically.
 - Episode selector behaves like a shell picker: arrow keys, `Enter`, `Esc` to bail.
-- Remembers what you watched last night, including translation choice – `anv --history` drops you right back in.
+- Remembers what you watched last night, including translation choice – `anv history` drops you right back in.
 - Reads manga too – `anv --manga` fetches chapters and pipes pages directly to your image viewer (mpv by default).
 - Manga page cache supports custom location via `--cache-dir`.
 - Jump directly to an episode with `-e` or `--episode` to skip the selection menu.
@@ -51,7 +51,7 @@ anv --manga --cache-dir "/tmp/anv-cache" "one punch man"
 
 Jump back to last night's cliffhanger:
 ```bash
-anv --history
+anv history
 ```
 
 Jump directly to an episode:
