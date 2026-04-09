@@ -1,4 +1,5 @@
 use anv::{
+    adapters::mal_client::build_mal_client_if_enabled,
     cli::{Cli, Commands, SyncAction},
     commands::{
         history::run_history_command,
@@ -8,7 +9,6 @@ use anv::{
     },
     config::AppConfig,
     history::History,
-    infra::sync::mal_client::build_mal_client_if_enabled,
 };
 
 use anyhow::Result;
