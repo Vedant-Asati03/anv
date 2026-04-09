@@ -1,11 +1,13 @@
 use crate::{
     adapters::{
-        reader::DefaultReaderGateway,
         providers::{
             allanime::AllAnimeClient, mangadex::MangaDexClient, mangapill::MangapillClient,
         },
+        reader::{
+            cache::{MangaCacheState, cache_manga_pages},
+            reader::DefaultReaderGateway,
+        },
     },
-    cache::{MangaCacheState, cache_manga_pages},
     cli::Cli,
     domain::services::progression::{next_label_presorted, sorted_labels_numeric},
     history::{History, HistoryEntry},
