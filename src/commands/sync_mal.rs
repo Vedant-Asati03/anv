@@ -1,6 +1,4 @@
-use crate::{
-    config::AppConfig, infra::sync::mal_gateway::MalSyncGateway, ports::sync_gateway::SyncGateway,
-};
+use crate::{adapters::mal_client::MalSyncGateway, config::AppConfig};
 
 use anyhow::{Context, Result, bail};
 
