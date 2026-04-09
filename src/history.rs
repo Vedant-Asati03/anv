@@ -1,14 +1,12 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use dialoguer::{Select, theme::ColorfulTheme};
 use dirs_next::data_dir;
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::PathBuf};
 
 use crate::types::{Provider, Translation};
+
+const FALLBACK_HISTORY_PATH: &str = "~/.local/share/anv/history.json";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HistoryEntry {
@@ -23,32 +21,42 @@ pub struct HistoryEntry {
     pub watched_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct History {
     pub entries: Vec<HistoryEntry>,
+    path: PathBuf,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            entries: vec![],
+            path: history_path(),
+        }
+    }
 }
 
 impl History {
-    pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+    pub fn load(&self) -> Result<Self> {
+        if !self.path.exists() {
             return Ok(Self::default());
         }
-        let data = fs::read_to_string(path)
-            .with_context(|| format!("failed to read history file {}", path.display()))?;
+        let data = fs::read_to_string(&self.path)
+            .with_context(|| format!("failed to read history file {}", self.path.display()))?;
         let history = serde_json::from_str(&data)
-            .with_context(|| format!("failed to parse history file {}", path.display()))?;
+            .with_context(|| format!("failed to parse history file {}", self.path.display()))?;
         Ok(history)
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
+    pub fn save(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create history directory {}", parent.display())
             })?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        fs::write(path, data)
-            .with_context(|| format!("failed to write history file {}", path.display()))?;
+        fs::write(self.path.clone(), data)
+            .with_context(|| format!("failed to write history file {}", self.path.display()))?;
         Ok(())
     }
 
@@ -76,51 +84,9 @@ impl History {
             .find(|e| e.show_id == show_id && e.translation == translation && e.is_manga)
             .map(|e| e.episode.clone())
     }
-
-    pub fn select_entry(&self) -> Result<Option<HistoryEntry>> {
-        if self.entries.is_empty() {
-            println!("History is empty.");
-            return Ok(None);
-        }
-
-        let items: Vec<String> = self
-            .entries
-            .iter()
-            .map(|entry| {
-                let tag = if entry.is_manga {
-                    if entry.translation == Translation::Raw {
-                        "Raw"
-                    } else {
-                        "Man"
-                    }
-                } else {
-                    entry.translation.label()
-                };
-                format!(
-                    "[{}] {} \u{00b7} {} {} \u{00b7} watched {}",
-                    tag,
-                    entry.show_title,
-                    if entry.is_manga { "chapter" } else { "episode" },
-                    entry.episode,
-                    entry.watched_at.format("%Y-%m-%d %H:%M")
-                )
-            })
-            .collect();
-
-        let selection = Select::with_theme(&theme())
-            .with_prompt("Select an entry to replay (Esc to cancel)")
-            .items(&items)
-            .default(0)
-            .interact_opt()?;
-        Ok(selection.map(|idx| self.entries[idx].clone()))
-    }
 }
 
-pub fn history_path() -> Result<PathBuf> {
-    let base = data_dir().ok_or_else(|| anyhow!("Could not determine data directory"))?;
-    Ok(base.join("anv").join("history.json"))
-}
-
-pub fn theme() -> ColorfulTheme {
-    ColorfulTheme::default()
+pub fn history_path() -> PathBuf {
+    let base = data_dir().unwrap_or_else(|| PathBuf::from(FALLBACK_HISTORY_PATH));
+    base.join("anv").join("history.json")
 }
