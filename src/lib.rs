@@ -1,8 +1,11 @@
+pub mod adapters;
 pub mod cache;
+pub mod cli;
+pub mod commands;
 pub mod config;
+pub mod domain;
 pub mod history;
-pub mod player;
-pub mod providers;
+pub mod ports;
+pub mod prompt;
 pub mod proxy;
-pub mod sync;
 pub mod types;
