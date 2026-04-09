@@ -4,6 +4,8 @@ use dirs_next::config_dir;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
+const FALLBACK_CONFIG_PATH: &str = "~/.config/anv/config.toml";
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     #[serde(default = "default_player")]
@@ -17,6 +19,8 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub sync: SyncConfig,
+
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -62,26 +66,21 @@ impl Default for AppConfig {
             binge: false,
             mal: MalConfig::default(),
             sync: SyncConfig::default(),
+            path: config_path(),
         }
     }
 }
 
 impl AppConfig {
-    pub fn config_path() -> Result<PathBuf> {
-        let base = config_dir().ok_or_else(|| anyhow!("Could not determine config directory"))?;
-        Ok(base.join("anv").join("config.toml"))
-    }
-
-    pub fn load() -> Result<Self> {
-        let path = Self::config_path()?;
-
-        if !path.exists() {
-            Self::write_defaults(&path)?;
+    pub fn load(&self) -> Result<Self> {
+        if !self.path.exists() {
+            Self::write_defaults(self)?
         }
 
         let cfg = Config::builder()
             .add_source(File::new(
-                path.to_str()
+                self.path
+                    .to_str()
                     .ok_or_else(|| anyhow!("Config path is not valid UTF-8"))?,
                 FileFormat::Toml,
             ))
@@ -97,29 +96,34 @@ impl AppConfig {
             .context("failed to deserialize config")
     }
 
-    fn write_defaults(path: &PathBuf) -> Result<()> {
-        if let Some(parent) = path.parent() {
+    fn write_defaults(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create config dir {}", parent.display()))?;
         }
         let default_cfg = AppConfig::default();
         let toml_str =
             toml::to_string_pretty(&default_cfg).context("failed to serialize default config")?;
-        fs::write(path, format!("{CONFIG_HEADER}{toml_str}"))
-            .with_context(|| format!("failed to write default config to {}", path.display()))?;
-        println!("Created default config at {}", path.display());
+        fs::write(&self.path, format!("{CONFIG_HEADER}{toml_str}")).with_context(|| {
+            format!("failed to write default config to {}", self.path.display())
+        })?;
+        println!("Created default config at {}", self.path.display());
         Ok(())
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::config_path()?;
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create config dir {}", parent.display()))?;
         }
         let toml_str = toml::to_string_pretty(self).context("failed to serialize config")?;
-        fs::write(&path, format!("{CONFIG_HEADER}{toml_str}"))
-            .with_context(|| format!("failed to write config to {}", path.display()))?;
+        fs::write(&self.path, format!("{CONFIG_HEADER}{toml_str}"))
+            .with_context(|| format!("failed to write config to {}", self.path.display()))?;
         Ok(())
     }
+}
+
+pub fn config_path() -> PathBuf {
+    let base = config_dir().unwrap_or_else(|| PathBuf::from(FALLBACK_CONFIG_PATH));
+    base.join("anv").join("config.toml")
 }
