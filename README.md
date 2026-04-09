@@ -63,7 +63,7 @@ Set a custom player (e.g. tuned mpv build):
 ```bash
 # via environment variable
 export ANV_PLAYER="/usr/bin/mpv --ytdl-format=best"
-anv "naruto"
+anv "frieren"
 
 # or permanently in ~/.config/anv/config.toml
 # player = "/usr/bin/mpv --ytdl-format=best"
@@ -98,51 +98,16 @@ enabled = true
 **3. Authenticate**
 
 ```bash
-anv sync enable mal
+anv sync enable
 ```
 
 This opens your browser to the MAL authorisation page. After you approve, the token is saved to your data directory and you're done.
-
-### Sync commands
-
-| Command | What it does |
-|---|---|
-| `anv sync enable mal` | Authenticate with MAL (runs OAuth flow if no token stored) |
-| `anv sync status` | Show whether sync is enabled, token validity, and expiry |
-| `anv sync disable` | Disable sync (`sync.enabled = false` in config) |
-
-### How sync works
-
-After each episode finishes playing:
-
-1. **First time seeing a show** — anv searches MAL for the title and shows you the English and Japanese names to confirm it found the right one. The match is cached locally so it never asks again for that series.
-2. **Progress update** — if the status on MAL is already `watching` and only the episode count changes, anv updates silently with no prompt. If the status is changing (e.g. adding to list for the first time, or reaching the final episode), anv asks for confirmation first.
-3. **Dates are set automatically:**
-   - `start_date` is sent when you first start watching (not on list, or previously `plan_to_watch`).
-   - `finish_date` is sent when anv marks the show as `completed`.
-
-## How the flow feels
-
-1. CLI asks AllAnime for matching series and shows you a clean list.
-2. Pick a show; anv fetches available episode numbers for the chosen translation.
-3. Episode picker highlights your last watched entry so Enter instantly resumes; Esc backs out like a prompt should.
-4. Streams are resolved through AllAnime's clock API and piped to `mpv` with the right headers and subtitles.
-5. History gets updated in `~/.local/share/anv/history.json` (Linux; platform-specific on others) so the next session remembers everything.
-6. If MAL sync is enabled, watch progress is synced silently or with a brief confirmation depending on what changed.
-
-## Tips and tweaks
-- Keep `mpv` upgraded – some providers only serve DASH/HLS variants that older builds struggle with.
-- If you want to experiment with custom players, set `player` in `~/.config/anv/config.toml` or use the `ANV_PLAYER` environment variable (env overrides config).
-- Use `--cache-dir <DIR>` if you want manga page cache files somewhere specific (faster disk, larger partition, etc.).
-- Use `-e <EP>` to skip the interactive episode selector and start playing a specific episode immediately.
-- Use `cargo install anv --force` to update when new AllAnime quirks pop up.
-- Run `anv sync status` to quickly check if your MAL token is still valid before a long watch session.
 
 ## Troubleshooting
 - `mpv` not found: install it or set `player` in your config (or `ANV_PLAYER` env var).
 - Streams empty: AllAnime occasionally throttles or shuffles providers; try again later or update anv.
 - History file corrupted: delete the JSON under your data dir and anv recreates it on launch.
-- MAL sync not working: run `anv sync status` to check token state, then `anv sync enable mal` to re-authenticate if needed.
+- MAL sync not working: run `anv sync status` to check token state, then `anv sync enable` to re-authenticate if needed.
 
 ## License
 
