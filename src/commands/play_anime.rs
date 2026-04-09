@@ -1,15 +1,15 @@
 use crate::{
+    adapters::{
+        mal_client::{
+            AnimeInfo, MalClient, MalIdCache, SyncUpdate, WatchStatus, should_confirm_sync,
+        },
+        player::DefaultPlayerGateway,
+        providers::allanime::AllAnimeClient,
+    },
     cli::Cli,
     domain::services::progression::{next_label_presorted, sorted_labels_numeric},
     history::{History, HistoryEntry},
-    infra::{
-        player::gateway::DefaultPlayerGateway,
-        providers::allanime::AllAnimeClient,
-        sync::mal_client::{
-            AnimeInfo, MalClient, MalIdCache, SyncUpdate, WatchStatus, should_confirm_sync,
-        },
-    },
-    ports::{player_gateway::PlayerGateway, providers_port::AnimeProvider},
+    ports::{providers::AnimeProvider},
     prompt::{confirm, rate, select_episode, select_show_entry},
     types::{Provider, ShowInfo, Translation},
 };

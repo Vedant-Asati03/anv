@@ -1,15 +1,15 @@
 use crate::{
-    cache::{MangaCacheState, cache_manga_pages},
-    cli::Cli,
-    domain::services::progression::{next_label_presorted, sorted_labels_numeric},
-    history::{History, HistoryEntry},
-    infra::{
-        player::gateway::DefaultPlayerGateway,
+    adapters::{
+        reader::DefaultReaderGateway,
         providers::{
             allanime::AllAnimeClient, mangadex::MangaDexClient, mangapill::MangapillClient,
         },
     },
-    ports::{player_gateway::PlayerGateway, providers_port::MangaProvider},
+    cache::{MangaCacheState, cache_manga_pages},
+    cli::Cli,
+    domain::services::progression::{next_label_presorted, sorted_labels_numeric},
+    history::{History, HistoryEntry},
+    ports::providers::MangaProvider,
     prompt::{select_episode, select_manga_entry},
     types::{MangaInfo, Provider, Translation},
 };
@@ -85,7 +85,7 @@ pub async fn read_manga(
     cache_base_override: Option<&Path>,
     provider: Provider,
 ) -> Result<()> {
-    let player_gateway = DefaultPlayerGateway;
+    let reader_gateway = DefaultReaderGateway;
     let chapters = match client.fetch_chapters(&manga.id, translation).await {
         Ok(c) => c,
         Err(err) => {
@@ -236,8 +236,8 @@ pub async fn read_manga(
             continue;
         }
 
-        player_gateway
-            .launch_image_viewer(
+        reader_gateway
+            .launch_reader(
                 &pages,
                 &cache_state.cached_pages,
                 &cache_state.cache_files,

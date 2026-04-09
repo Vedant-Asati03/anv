@@ -1,13 +1,13 @@
 use crate::{
-    cli::Cli,
-    commands::{play_anime, read_manga},
-    history::History,
-    infra::{
+    adapters::{
+        mal_client::MalClient,
         providers::{
             allanime::AllAnimeClient, mangadex::MangaDexClient, mangapill::MangapillClient,
         },
-        sync::mal_client::MalClient,
     },
+    cli::Cli,
+    commands::{play_anime, read_manga},
+    history::History,
     prompt::select_history_entry,
     types::{ChapterCounts, EpisodeCounts, MangaInfo, Provider, ShowInfo},
 };
