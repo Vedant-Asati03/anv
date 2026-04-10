@@ -12,7 +12,7 @@ pub async fn run_sync_enable_mal(config: &AppConfig) -> Result<()> {
              2. Set the app type to 'other' and redirect URI to: http://localhost:11422/callback\n\
              3. Copy the Client ID and add it to your config:\n\
              \n\
-             [mal]\n\
+             [sync]\n\
              client_id = \"<your-client-id>\"\n\
              \n\
              Config location: {}",

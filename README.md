@@ -88,11 +88,9 @@ Copy the **Client ID**.
 The config file lives at `~/.config/anv/config.toml` (Linux/macOS) or `%APPDATA%\anv\config.toml` (Windows).
 
 ```toml
-[mal]
-client_id = "<your-client-id>"
-
 [sync]
 enabled = true
+client_id = "<your-client-id>"
 ```
 
 **3. Authenticate**

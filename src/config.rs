@@ -44,14 +44,11 @@ const CONFIG_HEADER: &str = "# anv configuration
 # binge   — set to true to auto-play the next episode without prompting
 #           (can also be enabled per-session with the --binge flag)
 #
-# [mal]
+# [sync]
+#   enabled — set to true to sync watch status to MAL after each episode
 #   client_id — your MAL API client ID
 #               register at https://myanimelist.net/apiconfig
 #               redirect URI must be: http://localhost:11422/callback
-#
-# [sync]
-#   enabled — set to true to sync watch status to MAL after each episode
-
 ";
 
 impl Default for AppConfig {
@@ -86,7 +83,8 @@ impl AppConfig {
             .build()
             .context("failed to build config")?;
 
-        config.try_deserialize::<AppConfig>()
+        config
+            .try_deserialize::<AppConfig>()
             .context("failed to deserialize config")
     }
 
