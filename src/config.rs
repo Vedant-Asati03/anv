@@ -15,25 +15,20 @@ pub struct AppConfig {
     pub binge: bool,
 
     #[serde(default)]
-    pub mal: MalConfig,
-
-    #[serde(default)]
     pub sync: SyncConfig,
 
+    #[serde(skip, default = "config_path")]
     pub path: PathBuf,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct MalConfig {
-    /// MAL API client ID from https://myanimelist.net/apiconfig
-    #[serde(default)]
-    pub client_id: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SyncConfig {
     #[serde(default)]
     pub enabled: bool,
+
+    /// MAL API client ID from https://myanimelist.net/apiconfig
+    #[serde(default)]
+    pub client_id: String,
 }
 
 fn default_player() -> String {
@@ -64,7 +59,6 @@ impl Default for AppConfig {
         Self {
             player: default_player(),
             binge: false,
-            mal: MalConfig::default(),
             sync: SyncConfig::default(),
             path: config_path(),
         }
@@ -77,7 +71,7 @@ impl AppConfig {
             Self::write_defaults(self)?
         }
 
-        let cfg = Config::builder()
+        let config = Config::builder()
             .add_source(File::new(
                 self.path
                     .to_str()
@@ -92,7 +86,7 @@ impl AppConfig {
             .build()
             .context("failed to build config")?;
 
-        cfg.try_deserialize::<AppConfig>()
+        config.try_deserialize::<AppConfig>()
             .context("failed to deserialize config")
     }
 
