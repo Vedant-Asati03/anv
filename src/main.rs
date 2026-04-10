@@ -20,7 +20,10 @@ async fn run() -> Result<()> {
         eprintln!("Warning: failed to load history: {err}");
         History::default()
     });
-    let mut config = AppConfig::default();
+    let mut config = AppConfig::default().load().unwrap_or_else(|err| {
+        eprintln!("Warning: failed to load config: {err}");
+        AppConfig::default()
+    });
 
     match cli.command {
         Some(Commands::History) => {
