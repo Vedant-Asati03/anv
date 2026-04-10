@@ -2,6 +2,7 @@ use crate::{
     adapters::{
         providers::{
             allanime::AllAnimeClient, mangadex::MangaDexClient, mangapill::MangapillClient,
+            ports::MangaProvider,
         },
         reader::{
             cache::{MangaCacheState, cache_manga_pages},
@@ -11,7 +12,6 @@ use crate::{
     cli::Cli,
     domain::services::progression::{next_label_presorted, sorted_labels_numeric},
     history::{History, HistoryEntry},
-    ports::providers::MangaProvider,
     prompt::{select_episode, select_manga_entry},
     types::{MangaInfo, Provider, Translation},
 };
