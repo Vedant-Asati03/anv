@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 /// `anv sync enable` — authenticates with MAL if needed.
 pub async fn run_sync_enable_mal(config: &AppConfig) -> Result<()> {
     let sync_gateway = MalSyncGateway;
-    if config.mal.client_id.is_empty() {
+    if config.sync.client_id.is_empty() {
         bail!(
             "MAL client_id is not set.\n\
              1. Go to https://myanimelist.net/apiconfig and create an application.\n\
@@ -32,7 +32,7 @@ pub async fn run_sync_enable_mal(config: &AppConfig) -> Result<()> {
         _ => {}
     }
 
-    let client_id = config.mal.client_id.clone();
+    let client_id = config.sync.client_id.clone();
     let token = sync_gateway
         .authenticate(&client_id)
         .await
@@ -63,7 +63,7 @@ pub fn run_sync_status(config: &AppConfig) -> Result<()> {
         if config.sync.enabled { "yes" } else { "no" }
     );
 
-    if config.mal.client_id.is_empty() {
+    if config.sync.client_id.is_empty() {
         println!(
             "  client_id    : not set  (add to {})",
             config.path.display()
@@ -71,7 +71,7 @@ pub fn run_sync_status(config: &AppConfig) -> Result<()> {
     } else {
         let masked = format!(
             "{}…",
-            &config.mal.client_id[..config.mal.client_id.len().min(8)]
+            &config.sync.client_id[..config.sync.client_id.len().min(8)]
         );
         println!("  client_id    : {}", masked);
     }

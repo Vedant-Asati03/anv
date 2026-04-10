@@ -555,12 +555,12 @@ pub async fn build_mal_client_if_enabled(cfg: &AppConfig) -> Option<MalClient> {
     if !cfg.sync.enabled {
         return None;
     }
-    if cfg.mal.client_id.is_empty() {
+    if cfg.sync.client_id.is_empty() {
         eprintln!("[sync] mal.client_id is not set in config — sync disabled.");
         return None;
     }
     match MalToken::load() {
-        Ok(Some(token)) => match MalClient::from_token(cfg.mal.client_id.clone(), token).await {
+        Ok(Some(token)) => match MalClient::from_token(cfg.sync.client_id.clone(), token).await {
             Ok(client) => Some(client),
             Err(err) => {
                 eprintln!("[sync] Failed to initialize MAL client: {err}");
