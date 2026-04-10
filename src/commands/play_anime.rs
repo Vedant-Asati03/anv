@@ -7,8 +7,8 @@ use crate::{
         providers::{allanime::AllAnimeClient, ports::AnimeProvider},
     },
     cli::Cli,
-    domain::services::progression::{next_label_presorted, sorted_labels_numeric},
     history::{History, HistoryEntry},
+    progression::{next_label_presorted, sorted_labels_numeric},
     prompt::{confirm, rate, select_episode, select_show_entry},
     types::{Provider, ShowInfo, Translation},
 };

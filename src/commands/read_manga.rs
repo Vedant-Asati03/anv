@@ -10,8 +10,8 @@ use crate::{
         },
     },
     cli::Cli,
-    domain::services::progression::{next_label_presorted, sorted_labels_numeric},
     history::{History, HistoryEntry},
+    progression::{next_label_presorted, sorted_labels_numeric},
     prompt::{select_episode, select_manga_entry},
     types::{MangaInfo, Provider, Translation},
 };
