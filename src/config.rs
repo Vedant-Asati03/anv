@@ -93,9 +93,9 @@ impl AppConfig {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create config dir {}", parent.display()))?;
         }
-        let default_cfg = AppConfig::default();
-        let toml_str =
-            toml::to_string_pretty(&default_cfg).context("failed to serialize default config")?;
+        let default_config = AppConfig::default();
+        let toml_str = toml::to_string_pretty(&default_config)
+            .context("failed to serialize default config")?;
         fs::write(&self.path, format!("{CONFIG_HEADER}{toml_str}")).with_context(|| {
             format!("failed to write default config to {}", self.path.display())
         })?;
@@ -115,7 +115,7 @@ impl AppConfig {
     }
 }
 
-pub fn config_path() -> PathBuf {
+fn config_path() -> PathBuf {
     let base = config_dir().unwrap_or_else(|| PathBuf::from(FALLBACK_CONFIG_PATH));
     base.join("anv").join("config.toml")
 }
