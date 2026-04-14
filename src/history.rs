@@ -24,6 +24,8 @@ pub struct HistoryEntry {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct History {
     pub entries: Vec<HistoryEntry>,
+
+    #[serde(skip, default = "history_path")]
     path: PathBuf,
 }
 
@@ -41,10 +43,12 @@ impl History {
         if !self.path.exists() {
             return Ok(Self::default());
         }
+
         let data = fs::read_to_string(&self.path)
             .with_context(|| format!("failed to read history file {}", self.path.display()))?;
         let history = serde_json::from_str(&data)
             .with_context(|| format!("failed to parse history file {}", self.path.display()))?;
+
         Ok(history)
     }
 
@@ -86,7 +90,7 @@ impl History {
     }
 }
 
-pub fn history_path() -> PathBuf {
+fn history_path() -> PathBuf {
     let base = data_dir().unwrap_or_else(|| PathBuf::from(FALLBACK_HISTORY_PATH));
     base.join("anv").join("history.json")
 }
